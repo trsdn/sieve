@@ -20,6 +20,14 @@ const DECIDER = `http://127.0.0.1:${PORT}/v1/systemone`
 const LOOKUP_AT = 0.5
 const SEARCH = 'mcp__sieve__search'
 const KEEP_DAYS = 14
+// New topic: suggest a reset only when the decider is this sure (no follow-up was ever called new at 0.8,
+// eval/roles_eval.py). Reminder: a missed reminder costs more than a needless line, so the bar is low.
+const SWITCH_AT = 0.8
+// Lower the effort only for a session whose first request is clearly simple (no hard request was called
+// simple at 0.7, eval/effort_eval.py). Set once: changing effort invalidates the prompt cache.
+const SIMPLE_AT = 0.8
+const REMIND_AT = 0.4
+const REMINDER = 'sieve: this request will likely run tests, builds or logs. Write their output to a file and print only the summary and failures (cmd > /tmp/out.log 2>&1; echo exit=$?; tail -n 15 /tmp/out.log; grep -E "FAIL|ERROR" /tmp/out.log).'
 // The one thing context-mode's start-up text gets right, in a few words: plan commands so only
 // the answer comes back. Fixed text in the system prompt, so it is cached after the first request.
 const GUIDE = 'Tool output stays in every later request, so ask commands for the answer, not the data. For test runs, builds and long logs, write the output to a file and print only what you need, for example: cmd > /tmp/out.log 2>&1; echo exit=$?; tail -n 15 /tmp/out.log; grep -E "FAIL|ERROR|skipped" /tmp/out.log. This matters most when a command fails: Claude Code then cuts the middle of its output, where the failures usually are. Long results may come back summarised by sieve with the path of the full output: query that file instead of running the command again.'
@@ -42,6 +50,11 @@ const S = {
   recut: 0,
   restored: 0,
   prompt: '',
+  prompts: 0,
+  effort: undefined as undefined | 'low',
+  useEffort: true,
+  switches: 0,
+  reminders: 0,
   seen: 0,
   kept: 0,
   compacted: 0,
@@ -211,6 +224,59 @@ async function needsEveryLine($: any, e: any, full: string): Promise<boolean> {
   return false
 }
 
+// What the session has been doing, for the decider to compare a new request against.
+async function recentWork($: any): Promise<string> {
+  const raw = await sql($, `.mode json\nselect kind, data from events where session = ${sqlQuote(S.session)} and kind in ('prompt','file','command') order by ts desc limit 12;`)
+  const rows: { kind: string; data: string }[] = raw.trim() ? JSON.parse(raw) : []
+  const of = (k: string, n: number) => rows.filter(r => r.kind === k).slice(0, n).map(r => r.data.slice(0, 160))
+  return `Recent requests: ${of('prompt', 3).map(p => `'${p}'`).join(', ') || 'none'}. Recently edited: ${of('file', 4).join(', ') || 'nothing'}. Recently ran: ${of('command', 3).join('; ') || 'nothing'}.`
+}
+
+async function isNewTask($: any, text: string): Promise<boolean> {
+  const answers = await ask($, `${await recentWork($)}\nNew request: ${text.slice(0, 600)}`, {
+    q: {
+      type: 'choice',
+      instructions: 'Does the new request continue the recent work, or start a different, unrelated task?',
+      criteria: {
+        continue: 'a follow-up, fix, extension, question or action about the same work',
+        'new task': 'a different topic, project or kind of work that does not need the recent context',
+      },
+    },
+  })
+  const p = answers?.q?.probabilities?.['new task']
+  return typeof p === 'number' && p >= SWITCH_AT
+}
+
+async function isSimple($: any, text: string): Promise<boolean> {
+  const answers = await ask($, text.slice(0, 600), {
+    q: {
+      type: 'choice',
+      instructions: 'How much reasoning does this request need?',
+      criteria: {
+        simple: 'a lookup, a count, a one-line change, a rename, a quick factual question or running one command',
+        complex: 'debugging, designing, a change across several files, an unclear cause, or anything that needs careful thought',
+      },
+    },
+  })
+  const p = answers?.q?.probabilities?.simple
+  return typeof p === 'number' && p >= SIMPLE_AT
+}
+
+async function needsReminder($: any, text: string): Promise<boolean> {
+  const answers = await ask($, text.slice(0, 600), {
+    q: {
+      type: 'choice',
+      instructions: 'Will answering this request involve running tests, builds, installs or reading long logs?',
+      criteria: {
+        yes: 'it runs a test suite, a build or compile, an install, a linter, or reads logs or CI output',
+        no: 'it reads or edits code, explains, writes text, or answers a question',
+      },
+    },
+  })
+  const p = answers?.q?.probabilities?.yes
+  return typeof p === 'number' && p >= REMIND_AT
+}
+
 async function logUsage($: any, line: Record<string, unknown>) {
   try {
     await $.process.run(['sh', '-c', 'cat >> "$0"', `${S.dir}/usage.jsonl`], { stdin: `${JSON.stringify({ t: await $.clock.now(), ...line })}\n` })
@@ -290,6 +356,7 @@ export const register: Register = on => {
     const home = (await $.env.get('HOME')) ?? ''
     S.useDecider = (await $.env.get('SIEVE_DECIDER')) !== '0'
     S.guide = (await $.env.get('SIEVE_GUIDE')) !== '0'
+    S.useEffort = (await $.env.get('SIEVE_EFFORT')) !== '0'
     const slug = e.cwd.replace(/[/.]/g, '-')
     S.dir = `${home}/.claude/sieve`
     S.db = `${S.dir}/${slug}.db`
@@ -328,7 +395,7 @@ delete from events where ts < ${cutoff};`,
     const raw = await sql($, `.mode json\nselect count(*) as chunks, count(distinct source) as sources from chunks;`)
     const { chunks, sources } = JSON.parse(raw)[0]
     return {
-      text: `sieve: ${S.compacted} results cut this session, ~${Math.round(S.kept / 1000)}k chars kept out of context; ${S.restored} repeated calls got the whole output; ${chunks} chunks from ${sources} sources indexed (this project); decider ${S.deciderReady ? `ready, asked ${S.asked}x, allowed a cut ${S.askedYes}x` : 'off'}.`,
+      text: `sieve: ${S.compacted} results cut this session, ~${Math.round(S.kept / 1000)}k chars kept out of context; ${S.restored} repeated calls got the whole output; ${S.reminders} reminders, ${S.switches} new-task hints; ${chunks} chunks from ${sources} sources indexed (this project); decider ${S.deciderReady ? `ready, asked ${S.asked}x, allowed a cut ${S.askedYes}x` : 'off'}.`,
     }
   })
 
@@ -384,10 +451,47 @@ delete from events where ts < ${cutoff};`,
     return composed
   })
 
-  // The request is what the decider weighs a mid-sized result against.
+  // The main loop's requests carry the session's effort; subagents keep their own.
+  on('turn.step', async function* ($, e, next) {
+    if (S.effort && !e.agentId) return yield* next({ ...e, effort: S.effort })
+    return yield* next(e)
+  })
+
+  // The request is what the decider weighs results against; it also decides whether this turn
+  // starts a new topic (suggest a reset) and whether it needs the one-line reminder.
   on('prompt.submit', async ($, e, next) => {
-    S.prompt = e.text.slice(0, 500)
-    await record($, 'prompt', e.text.slice(0, 200)).catch(() => {})
-    return next(e)
+    const text = e.text
+    S.prompt = text.slice(0, 500)
+    let context = e.context ?? []
+    try {
+      // earlier prompts of this session, from the record: a resumed session starts a new process
+      const prior = Number((await sql($, `select count(*) from events where session = ${sqlQuote(S.session)} and kind = 'prompt';`)).trim() || 0)
+      // Effort is decided once, at the first request, and kept for the session (a resumed one included).
+      if (prior === 0) {
+        if (S.useEffort && (await isSimple($, text))) {
+          S.effort = 'low'
+          await record($, 'effort', 'low')
+          await logUsage($, { event: 'effort-low' })
+        }
+      } else {
+        const kept = (await sql($, `select data from events where session = ${sqlQuote(S.session)} and kind = 'effort' order by ts desc limit 1;`)).trim()
+        S.effort = kept === 'low' ? 'low' : undefined
+      }
+      if (prior >= 2 && (await isNewTask($, text))) {
+        S.switches += 1
+        $.ui.toast('sieve: this looks like a new task. /clear (or /compact) would keep the earlier work out of every request.')
+        await logUsage($, { event: 'new-task' })
+      }
+      if (S.guide && (await needsReminder($, text))) {
+        S.reminders += 1
+        context = [...context, REMINDER]
+        await logUsage($, { event: 'reminder' })
+      }
+    } catch {
+      // the decider is optional
+    }
+    S.prompts += 1
+    await record($, 'prompt', text.slice(0, 200)).catch(() => {})
+    return next(context === e.context ? e : { ...e, context })
   })
 }

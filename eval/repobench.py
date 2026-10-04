@@ -27,6 +27,7 @@ VARIANTS = {
     "context-mode": (["--plugin-dir", CM], TOOLS + ",mcp__plugin_context-mode_context-mode", {}),
     "sieve-rules": (["--plugin-dir", SIEVE], TOOLS + ",mcp__sieve__search", {"SIEVE_DECIDER": "0"}),
     "sieve": (["--plugin-dir", SIEVE], TOOLS + ",mcp__sieve__search", {}),
+    "sieve-no-effort": (["--plugin-dir", SIEVE], TOOLS + ",mcp__sieve__search", {"SIEVE_EFFORT": "0"}),
 }
 
 

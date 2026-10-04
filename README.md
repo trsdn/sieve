@@ -57,6 +57,25 @@ Results of Bash, Grep, Glob, WebFetch, any MCP tool that returns text, and Playw
 - Measurement: `~/.claude/sieve/usage.jsonl` (tool, size, verdict; no content), `eval/usage_report.py`; `/sieve` shows cuts, chars kept out, repeated calls restored, decider use; the status line shows chars kept out. `SIEVE_DECIDER=0` turns the decider off (the rule and size limits still apply, but then nothing in the middle band is cut).
 - There is no `execute` tool any more: it was never called in any test.
 
+### The decider's jobs
+
+The decider makes small, fast, local decisions that a rule cannot make and that would be too slow or too expensive for a model call. Each job was tested on its own prompt set before it was built (`eval/`), with a hold-out part that was not used to pick the threshold, and each errs on the safe side.
+
+| Job | Question | Action | Test (dev / hold-out) |
+| --- | --- | --- | --- |
+| Lookup or overview | Is the request a lookup or count, or an overview? | cut a repetitive mid-sized result only for an overview | kept 125/125 needed outputs; harder set 40/40 kept, 35/40 cut |
+| New task | Does the request continue the recent work or start an unrelated task? | a toast suggesting `/clear` or `/compact` (never automatic) | at 0.8: 68/72 and 35/36 new tasks found, no follow-up ever called new |
+| Reminder | Will the request run tests, builds, installs or read logs? | one reminder line in that turn (new text only, so the cache is untouched) | at 0.4: 10/10 and 5/5 found, no false alarm |
+| Effort | Does the session's first request need real reasoning? | `low` effort for the whole session when it is clearly simple | at 0.7: 18/18 simple found, no hard request called simple; 0.8 is used |
+
+Effort is set once per session and kept (a resumed session reads it back), because the API invalidates the prompt cache whenever effort or thinking settings change; switching per step would cost more than it saves. The new-task check reads earlier prompts from the session record, so it also works when a session is resumed in a new process. `SIEVE_EFFORT=0` turns the effort job off.
+
+Measured effects:
+- Effort, single quick questions on the real repository (12 sessions per setup): output tokens median 165 with the effort job, 194 without, 234 for no plugin; all 36 answers right; cost about 3% lower (short sessions are dominated by input).
+- Effort, the five-step repository session (3 sessions each, side by side): the first request is simple, so effort was `low` for all three sessions, including the bug fix. All 15 steps right in both; cost $0.154 against $0.196 (-21%), window-turns 206,565 against 235,578 (-12%). The bug is easy; a session that starts simple and turns hard is the risk, and it is not measured yet.
+- Reminder, the verbose test step (5 runs): no gain over the guide alone (38k against 37k window-turns); the guide already does that work there. Kept because it costs one line.
+- New task, live over a resumed five-prompt session: only the unrelated prompt (a haiku in the middle of a bug fix) was flagged; the follow-ups before and after were not.
+
 ### What was measured, and what was not
 
 | Evaluation | Result |
