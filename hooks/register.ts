@@ -66,6 +66,11 @@ const S = {
   asked: 0,
   askedYes: 0,
   indexed: 0,
+  // Real-use measurement: a holdout session only logs what it would have done; bench runs are marked.
+  holdout: false,
+  cutPaths: [] as string[],
+  bench: false,
+  project: '',
 }
 
 async function sql($: any, script: string) {
@@ -267,9 +272,10 @@ async function isNewTask($: any, text: string): Promise<boolean> {
   return typeof p === 'number' && p >= SWITCH_AT
 }
 
-async function isSimple($: any, text: string): Promise<boolean> {
+// Both questions read the same state (the request alone), so they share one decider call.
+async function promptSignals($: any, text: string): Promise<{ simple?: number; remind?: number }> {
   const answers = await ask($, text.slice(0, 600), {
-    q: {
+    simple: {
       type: 'choice',
       instructions: 'How much reasoning does this request need?',
       criteria: {
@@ -277,14 +283,7 @@ async function isSimple($: any, text: string): Promise<boolean> {
         complex: 'debugging, designing, a change across several files, an unclear cause, or anything that needs careful thought',
       },
     },
-  })
-  const p = answers?.q?.probabilities?.simple
-  return typeof p === 'number' && p >= SIMPLE_AT
-}
-
-async function needsReminder($: any, text: string): Promise<boolean> {
-  const answers = await ask($, text.slice(0, 600), {
-    q: {
+    remind: {
       type: 'choice',
       instructions: 'Will answering this request involve running tests, builds, installs or reading long logs?',
       criteria: {
@@ -293,13 +292,14 @@ async function needsReminder($: any, text: string): Promise<boolean> {
       },
     },
   })
-  const p = answers?.q?.probabilities?.yes
-  return typeof p === 'number' && p >= REMIND_AT
+  const num = (v: unknown) => (typeof v === 'number' ? v : undefined)
+  return { simple: num(answers?.simple?.probabilities?.simple), remind: num(answers?.remind?.probabilities?.yes) }
 }
 
 async function logUsage($: any, line: Record<string, unknown>) {
   try {
-    await $.process.run(['sh', '-c', 'cat >> "$0"', `${S.dir}/usage.jsonl`], { stdin: `${JSON.stringify({ t: await $.clock.now(), ...line })}\n` })
+    const tag = { s: S.session, p: S.project, ...(S.holdout ? { holdout: true } : {}), ...(S.bench ? { bench: true } : {}) }
+    await $.process.run(['sh', '-c', 'cat >> "$0"', `${S.dir}/usage.jsonl`], { stdin: `${JSON.stringify({ t: await $.clock.now(), ...tag, ...line })}\n` })
   } catch {
     // measurement must never get in the way
   }
@@ -360,13 +360,14 @@ async function compact($: any, e: any, ran: any): Promise<any | undefined> {
   let cut = verdict === 'compact' || verdict === 'filter'
   if (verdict === 'ask' && repetitive) cut = !(await needsEveryLine($, e, full))
   await logUsage($, { tool: key === 'mcp' ? 'mcp' : e.tool, sig, size, verdict, repetitive, json: json !== undefined, cut })
-  if (!cut) return undefined
+  if (!cut || S.holdout) return undefined
 
   const source = `${e.tool}:${(await $.clock.now()).toString(36)}${++S.seen}`.replace(/[^\w.:-]/g, '_')
   if (!path) {
     path = `${S.out}/sieve-${source.replace(/:/g, '-')}.txt`
     await $.fs.write(path, full)
   }
+  S.cutPaths.push(path.split('/').pop()!)
   const foot = `[sieve: ${full.length} chars summarised. Full output: ${path}. For exact counts or lookups run grep/wc/awk on that file; ${SEARCH} finds passages. Repeat the same call to get everything.]`
   const short = filtered ? `${filtered}\n${foot}` : json ? `${json}\n${foot}` : repetitive ? `${summarize(e.tool, full)}\n${foot}` : `${compactText(full, { head: 1800, tail: 1200, signal: 15 })}\n${foot}`
   await index($, source, full)
@@ -384,6 +385,10 @@ export const register: Register = on => {
     S.useDecider = (await $.env.get('SIEVE_DECIDER')) !== '0'
     S.guide = (await $.env.get('SIEVE_GUIDE')) !== '0'
     S.useEffort = (await $.env.get('SIEVE_EFFORT')) !== '0'
+    // SIEVE_HOLDOUT=0.2: one session in five changes nothing and only logs, the control group for real use.
+    S.holdout = Math.random() < Number((await $.env.get('SIEVE_HOLDOUT')) ?? 0)
+    S.bench = (await $.env.get('SIEVE_BENCH')) === '1' || /\/(sieve-bench-runs|\.scratch)\//.test(`${e.cwd}/`)
+    S.project = projectKey(e.cwd)
     // The harness's own slug for its projects folder (S.out must match it); the index gets a collision-free key.
     const slug = e.cwd.replace(/[/.]/g, '-')
     S.dir = `${home}/.claude/sieve`
@@ -427,11 +432,17 @@ delete from events where ts < ${cutoff};`,
     }
   })
 
-  on('tool.call', { tool: 'mcp__sieve__search' }, async ($, e: any) => text(await search($, e.queries, e.limit ?? 3)))
+  on('tool.call', { tool: 'mcp__sieve__search' }, async ($, e: any) => {
+    await logUsage($, { event: 'search' })
+    return text(await search($, e.queries, e.limit ?? 3))
+  })
 
   // Every result passes here: recorded for the resume note, cut when it is large.
   on('tool.call', async ($, e: any, next) => {
     if (e.tool.startsWith('mcp__sieve__')) return next(e)
+    // The model going back to a cut output: the summary was not enough on its own.
+    const called = JSON.stringify(e)
+    if (S.cutPaths.some(f => called.includes(f))) await logUsage($, { event: 'followup', tool: e.tool })
     const repeat = watchRepeat(e)
     const ran = await next(e)
     if (!LIMITS[limitKey(e)]) await logUsage($, { tool: e.tool, size: String(ran.text ?? '').length })
@@ -470,7 +481,7 @@ delete from events where ts < ${cutoff};`,
     try {
       const raw = await sql($, `.mode json\nselect snapshot from resume where session = ${sqlQuote(S.session)};`)
       const note = raw.trim() ? JSON.parse(raw)[0]?.snapshot : ''
-      const guide = S.guide ? [{ id: 'sieve:guide', text: GUIDE, scope: 'session' as const }] : []
+      const guide = S.guide && !S.holdout ? [{ id: 'sieve:guide', text: GUIDE, scope: 'session' as const }] : []
       const resume = note ? [{ id: 'sieve:resume', text: `Before the last compaction, this session had:\n${note}`, scope: 'session' as const }] : []
       return { sections: [...composed.sections, ...guide, ...resume] }
     } catch {
@@ -494,12 +505,16 @@ delete from events where ts < ${cutoff};`,
     try {
       // earlier prompts of this session, from the record: a resumed session starts a new process
       const prior = Number((await sql($, `select count(*) from events where session = ${sqlQuote(S.session)} and kind = 'prompt';`)).trim() || 0)
+      const sig = await promptSignals($, text)
+      await logUsage($, { event: 'prompt', n: prior, simple: sig.simple, remind: sig.remind })
       // Effort is decided once, at the first request, and kept for the session (a resumed one included).
       if (prior === 0) {
-        if (S.useEffort && (await isSimple($, text))) {
-          S.effort = 'low'
-          await record($, 'effort', 'low')
+        if (S.useEffort && (sig.simple ?? 0) >= SIMPLE_AT) {
           await logUsage($, { event: 'effort-low' })
+          if (!S.holdout) {
+            S.effort = 'low'
+            await record($, 'effort', 'low')
+          }
         }
       } else {
         const kept = (await sql($, `select data from events where session = ${sqlQuote(S.session)} and kind = 'effort' order by ts desc limit 1;`)).trim()
@@ -507,18 +522,19 @@ delete from events where ts < ${cutoff};`,
       }
       if (prior >= 2 && (await isNewTask($, text))) {
         S.switches += 1
+        await logUsage($, { event: 'new-task' })
+        if (!S.holdout)
         // Effort stays low for the session (changing it breaks the cache); /clear is the clean place to reset it.
         $.ui.toast(
           S.effort === 'low'
             ? 'sieve: this looks like a new task, and this session runs at low effort. /clear keeps the earlier work out of every request and restores normal effort.'
             : 'sieve: this looks like a new task. /clear (or /compact) would keep the earlier work out of every request.',
         )
-        await logUsage($, { event: 'new-task' })
       }
-      if (S.guide && (await needsReminder($, text))) {
+      if (S.guide && (sig.remind ?? 0) >= REMIND_AT) {
         S.reminders += 1
-        context = [...context, REMINDER]
         await logUsage($, { event: 'reminder' })
+        if (!S.holdout) context = [...context, REMINDER]
       }
     } catch {
       // the decider is optional

@@ -87,6 +87,18 @@ Measured effects:
 
 Over four prompt sets the chosen setting kept all 125 requests that need the whole output; the 0.5 threshold was picked on those same sets, and the first three sets share phrasing with the criteria, so read the cut rate (83-100%) as optimistic and the harder set (88%) as the better estimate. All prompts and outputs are small, hand-written and from one person.
 
+## Real use (`eval/real_report.py`)
+
+Benchmarks are written by the people who build the tool; real sessions are the test that counts. Load sieve in every session and keep a control group:
+
+```json
+"env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/dev/sieve", "SIEVE_HOLDOUT": "0.2" }
+```
+
+in `~/.claude/settings.json`. With `SIEVE_HOLDOUT=0.2` one session in five is a holdout: no cuts, no guide, no effort change, no reminder, no toast; it only logs what it would have done. Every line of `usage.jsonl` carries the session id and a project key; bench runs (cwd under `sieve-bench-runs` or `.scratch`, or `SIEVE_BENCH=1`) are marked and left out. Logged per session: each prompt's p(simple) and p(reminder) (one decider call for both), cuts and would-be cuts, follow-ups (a later call that reads a cut output's file), searches, restored repeats.
+
+`python3 eval/real_report.py [--days N] [--sessions]` joins that log with Claude Code's own transcripts (`~/.claude/projects/*/<session>.jsonl`, token usage per model call) and compares active sessions with the holdout: window-turns, per call, output tokens, calls; how often the model went back to a cut output; and how many low-effort sessions later had a request with p(simple) < 0.3 (the effort job's known risk).
+
 ## Benchmark (`eval/bench.py`, `eval/report.py`)
 
 13 tasks on a generated project (`eval/make_fixture.py`) with large logs, data, file trees, test output and git history, headless `claude -p`, medians. **Incomplete**: 151 of 260 planned runs (`eval/bench_v2.jsonl`; the script resumes where it stopped).
@@ -138,6 +150,8 @@ sieve ends the session with a window 29% smaller than no plugin and a session 29
 Why context-mode does not help here, as far as the traces show: in two probe runs the model made only plain Bash and Grep calls and never a `ctx_*` call, so context-mode contributed its fixed cost (about 3-6k tokens of tool descriptions and routing text) and no cuts. Its method depends on the model choosing its tools, and a prompt that dictates the command overrides that. These prompts dictate the command by design (so large output cannot be avoided), which is not how context-mode is meant to be used: this test favours a transparent approach, and a fairer test for context-mode would let the model pick its own commands. Not run.
 
 ### Long session, model chooses its own commands (`LONG_FREE=1`)
+
+**v3** (Claude Code 2.1.289, 3 repetitions, `eval/long_free_results_v3.jsonl`): window after step 9: no plugin 22,768, sieve 22,490, context-mode 42,062; cost $0.136, $0.136, $0.293; 9/9 right in all. Same picture as before: with free choice sieve neither helps nor costs; context-mode costs twice as much.
 
 The same nine questions, phrased naturally ("how many lines contain ERROR?"), results in `eval/long_free_results.jsonl`.
 
