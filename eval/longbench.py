@@ -43,7 +43,8 @@ TOOLS = "Bash,Read,Grep,Glob"
 VARIANTS = {
     "base": ([], TOOLS, {}),
     "context-mode": (["--plugin-dir", CM], TOOLS + ",mcp__plugin_context-mode_context-mode", {}),
-    "sieve": (["--plugin-dir", SIEVE], TOOLS + ",mcp__sieve__execute,mcp__sieve__search", {}),
+    "sieve": (["--plugin-dir", SIEVE], TOOLS + ",mcp__sieve__search", {}),
+    "sieve-rules": (["--plugin-dir", SIEVE], TOOLS + ",mcp__sieve__search", {"SIEVE_DECIDER": "0"}),
 }
 
 
