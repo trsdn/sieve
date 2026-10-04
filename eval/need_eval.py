@@ -13,6 +13,8 @@ outs = {
     "make": ("make build", "\n".join(f"[{i%100:3d}%] Building CXX object src/mod_{i}.cc.o" for i in range(150))),
 }
 NEED = ["Count how many entries in this output end in .txt.", "How many requests returned status 500? Give the exact number.", "List every file whose name contains 'a'.", "Find the exact line for spec_77 and tell me its duration.", "How many objects were built in total?", "Does the entry for 'Berlin' exist? I need a definite yes or no."]
+HOLDOUT_NEED = ["How many lines are there in total?", "Give me the exact count of entries containing the digit 7.", "Is 'spec_12' in this output? Answer definitely.", "What is the very last entry?", "Count the lines with status 500."]
+HOLDOUT_SKIM = ["What am I looking at here?", "Anything alarming in this?", "Describe the general pattern of these lines.", "Is this roughly what a healthy run looks like?", "Give me the gist."]
 SKIM = ["Give me a rough idea of what this output contains.", "Skim this and tell me if anything looks broken.", "What kind of output is this? One sentence.", "Is the command working, roughly?", "Summarize what this shows in general terms.", "Does this look like a normal run?"]
 Q = {"need": {"type": "choice", "instructions": "To answer the request, how much of the output has to be read?", "criteria": {"every line": "the answer depends on counting, exact lookup or completeness over the whole output", "a sample": "a general idea, a summary or a check for obvious problems is enough"}}}
 
@@ -25,10 +27,16 @@ def ask(request, name):
 
 
 res = {"need": [], "skim": []}
+ho = {"need": [], "skim": []}
 for name in outs:
     res["need"] += [ask(p, name) for p in NEED]
     res["skim"] += [ask(p, name) for p in SKIM]
-for th in (0.3, 0.4, 0.5, 0.6, 0.7):
+    ho["need"] += [ask(p, name) for p in HOLDOUT_NEED]
+    ho["skim"] += [ask(p, name) for p in HOLDOUT_SKIM]
+for th in (0.7, 0.8, 0.9):
     keep = sum(p >= th for p in res["need"])
     cut = sum(p < th for p in res["skim"])
     print(f"every-line >= {th}: kept whole when needed {keep}/{len(res['need'])}, cut when a skim is enough {cut}/{len(res['skim'])}")
+print("hold-out prompts, never used to pick the threshold:")
+for th in (0.7, 0.8, 0.9):
+    print(f"every-line >= {th}: kept whole when needed {sum(p >= th for p in ho['need'])}/{len(ho['need'])}, cut when a skim is enough {sum(p < th for p in ho['skim'])}/{len(ho['skim'])}")

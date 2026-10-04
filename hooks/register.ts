@@ -1,6 +1,7 @@
 import type { Register } from 'claude-code'
 import {
   LIMITS,
+  isRepetitive,
   RESULT_LIMIT,
   buildSnapshot,
   chunkText,
@@ -10,29 +11,17 @@ import {
   interpreter,
   judgeSize,
   sqlQuote,
+  summarize,
 } from './lib'
 
 const PORT = 8765
 const DECIDER = `http://127.0.0.1:${PORT}/v1/systemone`
 // Decider confidence needed before it may cut a mid-sized result / reshape the cut for a task.
-const VERBOSE_AT = 0.6
-const TASK_AT = 0.4
 // Above this, the request is read as needing every line, and the output stays whole.
 const NEED_BELOW = 0.7
 const SEARCH = 'mcp__sieve__search'
 
 const text = (t: string) => ({ result: [{ type: 'text', text: t }] })
-
-const TASKS = {
-  explore: 'reading or searching code to understand it',
-  debug: 'investigating an error, failing test or log output',
-  implement: 'writing or changing code',
-  review: 'reviewing a diff, a PR or existing work',
-  question: 'a short question that needs an answer, not tool work',
-}
-
-// How much of a result the current task tolerates: exploring wants less, debugging more.
-const FACTOR: Record<string, number> = { explore: 0.6, debug: 1.5 }
 
 const S = {
   checkedAt: 0,
@@ -41,7 +30,10 @@ const S = {
   session: '',
   db: '',
   deciderReady: false,
-  factor: 1,
+  dir: '',
+  cuts: [] as { what: string; left: number }[],
+  recut: 0,
+  executed: 0,
   prompt: '',
   seen: 0,
   kept: 0,
@@ -192,18 +184,11 @@ function describe(e: any): string {
   return String(e.command ?? e.pattern ?? e.url ?? e.file_path ?? e.tool)
 }
 
-// The decider's one job on a result: is this mostly repetition a short excerpt can stand for?
-async function isVerbose($: any, e: any, full: string): Promise<boolean> {
-  const request = S.prompt ? `Request: ${S.prompt}\n` : ''
-  const answers = await ask($, `${request}${e.tool}: ${describe(e)}\n---\n${full.slice(0, 1500)}\n…\n${full.slice(-500)}`, {
-    verbose: {
-      type: 'choice',
-      instructions: 'What is the nature of this tool output?',
-      criteria: {
-        repetitive: 'many similar lines: a listing, a log, progress output, a tree',
-        distinct: 'varied content that is read as a whole: code, configuration, prose, a stack trace',
-      },
-    },
+// The decider's one job on a result: does the request need every line of it? The rule has
+// already said the output is repetitive; code and prose never get here.
+async function needsEveryLine($: any, e: any, full: string): Promise<boolean> {
+  if (!S.prompt) return true
+  const answers = await ask($, `Request: ${S.prompt}\n${e.tool}: ${describe(e)}\n---\n${full.slice(0, 1500)}\n…\n${full.slice(-500)}`, {
     need: {
       type: 'choice',
       instructions: 'To answer the request, how much of the output has to be read?',
@@ -213,43 +198,66 @@ async function isVerbose($: any, e: any, full: string): Promise<boolean> {
       },
     },
   })
-  const repetitive = answers?.verbose?.probabilities?.repetitive
-  const everyLine = answers?.need?.probabilities?.['every line']
-  if (typeof repetitive !== 'number') return false
+  const p = answers?.need?.probabilities?.['every line']
   S.asked += 1
-  // Cut only a repetitive output the request does not need in full; no request known, no cut on that count.
-  const cut = repetitive >= VERBOSE_AT && (!S.prompt || (typeof everyLine === 'number' && everyLine < NEED_BELOW))
-  if (cut) S.askedYes += 1
-  return cut
+  // No answer means keep it whole: a wrong cut costs a round trip, a missed cut only some bytes.
+  if (typeof p !== 'number' || p >= NEED_BELOW) return true
+  S.askedYes += 1
+  return false
 }
 
-// Cuts a large built-in result in place: the model gets head, tail and the failure lines, the
-// whole output goes into the index. Undefined means leave the result as it is.
+async function logUsage($: any, line: Record<string, unknown>) {
+  try {
+    await $.process.run(['sh', '-c', 'cat >> "$0"', `${S.dir}/usage.jsonl`], { stdin: `${JSON.stringify({ t: await $.clock.now(), ...line })}\n` })
+  } catch {
+    // measurement must never get in the way
+  }
+}
+
+// A cut that is followed within two calls by the same command or file read again was a wrong cut.
+function watchRecut(e: any) {
+  for (const c of S.cuts) {
+    if (c.left <= 0) continue
+    c.left -= 1
+    if (describe(e) === c.what && c.left >= 0) S.recut += 1
+  }
+  S.cuts = S.cuts.filter(c => c.left > 0)
+}
+
+// Cuts a large built-in result in place: the model gets a summary of its structure, the whole
+// output stays in a file and in the index. Undefined means leave the result as it is.
 async function compact($: any, e: any, ran: any): Promise<any | undefined> {
   const r = ran.result
   if (ran.deny !== undefined || !r || !LIMITS[e.tool]) return undefined
   let full = textOf(e.tool, r)
   if (typeof full !== 'string') return undefined
-  // Bash keeps a long output in a file and hands back a preview: index the file, not the preview.
-  if (r.persistedOutputPath) {
+  // Bash keeps a long output in a file and hands back a preview: use the file, not the preview.
+  let path: string | undefined = r.persistedOutputPath
+  if (path) {
     try {
-      full = await $.fs.read(r.persistedOutputPath)
+      full = await $.fs.read(path)
     } catch {
       // over 4 MiB or gone: the preview is what there is
     }
   }
   const size = e.tool === 'Glob' ? r.filenames.length : full.length
-  let verdict = judgeSize(e.tool, size, ran.isError === true, S.factor)
-  if (verdict === 'ask') verdict = (await isVerbose($, e, full)) ? 'compact' : 'pass'
-  if (verdict !== 'compact') return undefined
+  const verdict = judgeSize(e.tool, size, ran.isError === true, 1)
+  const repetitive = e.tool === 'Glob' || isRepetitive(full)
+  let cut = verdict === 'compact'
+  if (verdict === 'ask' && repetitive) cut = !(await needsEveryLine($, e, full))
+  await logUsage($, { tool: e.tool, size, verdict, repetitive, cut })
+  if (!cut) return undefined
 
   const source = `${e.tool}:${(await $.clock.now()).toString(36)}${++S.seen}`
-  const note = `[sieve: ${full.length} chars cut; the whole output is indexed as "${source}", query it with ${SEARCH}]`
-  const short =
-    e.tool === 'Glob'
-      ? [...full.split('\n').slice(0, 100), `… ${size - 100} more paths omitted. ${note}`].join('\n')
-      : `${compactText(full, { head: 1800, tail: 1200, signal: 15 })}\n${note}`
+  if (!path) {
+    path = `${S.dir}/out/${source.replace(/[^\w.-]/g, '_')}.txt`
+    await $.fs.write(path, full)
+  }
+  const foot = `[sieve: ${full.length} chars summarised. Full output: ${path}. For exact counts or lookups run grep/wc/awk on that file; ${SEARCH} finds passages.]`
+  const short = repetitive ? `${summarize(e.tool, full)}\n${foot}` : `${compactText(full, { head: 1800, tail: 1200, signal: 15 })}\n${foot}`
   await index($, source, full)
+  await record($, 'cut', `${source} ${describe(e)}`)
+  S.cuts.push({ what: describe(e), left: 2 })
   S.kept += full.length - short.length
   S.compacted += 1
   return { result: withText(e.tool, r, short) }
@@ -261,8 +269,10 @@ export const register: Register = on => {
     S.useDecider = (await $.env.get('SIEVE_DECIDER')) !== '0'
     const dir = `${home}/.claude/sieve`
     S.db = `${dir}/index.db`
+    S.dir = dir
     S.session = await $.session.id()
-    await $.process.run(['mkdir', '-p', dir])
+    await $.process.run(['mkdir', '-p', `${dir}/out`])
+    await $.process.run(['find', `${dir}/out`, '-type', 'f', '-mtime', '+7', '-delete'])
     await sql(
       $,
       `create virtual table if not exists chunks using fts5(source, title, body, tokenize='porter unicode61');\ncreate table if not exists events (session text, ts integer, kind text, data text);\ncreate table if not exists resume (session text primary key, snapshot text, count integer);`,
@@ -301,11 +311,13 @@ export const register: Register = on => {
     const raw = await sql($, `.mode json\nselect count(*) as chunks, count(distinct source) as sources from chunks;`)
     const { chunks, sources } = JSON.parse(raw)[0]
     return {
-      text: `sieve: ${S.compacted} results cut this session, ~${Math.round(S.kept / 1000)}k chars kept out of context; ${chunks} chunks from ${sources} sources indexed; decider ${S.deciderReady ? `ready, asked ${S.asked}x, said cut ${S.askedYes}x` : 'off'}.`,
+      text: `sieve: ${S.compacted} results cut this session, ~${Math.round(S.kept / 1000)}k chars kept out of context; ${chunks} chunks from ${sources} sources indexed; wrong cuts (same call repeated within 2) ${S.recut}; decider ${S.deciderReady ? `ready, asked ${S.asked}x, allowed a cut ${S.askedYes}x` : 'off'}.`,
     }
   })
 
   on('tool.call', { tool: 'mcp__sieve__execute' }, async ($, e: any) => {
+    S.executed += 1
+    await logUsage($, { tool: 'sieve.execute' })
     const label = `execute:${e.language}:${(await $.clock.now()).toString(36)}`
     let out = await run($, e.language, e.code, e.timeout_ms ?? 30000, label)
     if (e.intent && out.includes('full output indexed')) out += `\n\n${await search($, [e.intent])}`
@@ -316,8 +328,10 @@ export const register: Register = on => {
 
   // Every built-in result passes here: recorded for the resume note, cut when it is large.
   on('tool.call', async ($, e: any, next) => {
+    if (!S.inner && !e.tool.startsWith('mcp__sieve__')) watchRecut(e)
     const ran = await next(e)
     if (S.inner || e.tool.startsWith('mcp__sieve__')) return ran
+    if (!LIMITS[e.tool]) await logUsage($, { tool: e.tool, size: String(ran.text ?? '').length })
     try {
       if (['Edit', 'Write', 'NotebookEdit'].includes(e.tool) && ran.deny === undefined) await record($, 'file', e.file_path ?? e.notebook_path)
       else if (e.tool === 'Bash' && ran.deny === undefined) await record($, ran.isError ? 'error' : 'command', e.command)
@@ -352,21 +366,10 @@ export const register: Register = on => {
     return composed
   })
 
-  // The decider reads the prompt and sets how hard results are cut for this turn.
+  // The request is what the decider weighs a mid-sized result against.
   on('prompt.submit', async ($, e, next) => {
-    S.factor = 1
     S.prompt = e.text.slice(0, 500)
     await record($, 'prompt', e.text.slice(0, 200)).catch(() => {})
-    const answers = await ask($, e.text.slice(0, 4000), {
-      task: { type: 'choice', instructions: 'What kind of work does this request mainly ask for?', criteria: TASKS },
-    })
-    const task = answers?.task
-    if (task && task.confidence >= TASK_AT && FACTOR[task.choice]) {
-      S.factor = FACTOR[task.choice]!
-      $.ui.status(`sieve: ${task.choice} ×${S.factor}`)
-    } else {
-      $.ui.status(undefined)
-    }
     return next(e)
   })
 }

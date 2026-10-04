@@ -17,10 +17,10 @@ def table(key, title):
     for r in ok:
         g[key(r)].append(r)
     print(title)
-    print(f"{'':24}{'runs':>5}{'correct':>9}{'turns':>7}{'cost $':>9}{'tokens':>10}{'secs':>7}")
+    print(f"{'':24}{'runs':>5}{'correct':>9}{'turns':>7}{'cost $':>9}{'tokens':>10}{'uncached':>10}{'ctx end':>9}{'secs':>7}")
     for k, v in sorted(g.items()):
         print(f"{str(k):24}{len(v):>5}{sum(r['correct'] for r in v) / len(v):>9.0%}{st.median(r['turns'] for r in v):>7.0f}"
-              f"{st.median(r['cost'] for r in v):>9.4f}{st.median(tokens(r) for r in v):>10.0f}{st.median(r['secs'] for r in v):>7.0f}")
+              f"{st.median(r['cost'] for r in v):>9.4f}{st.median(tokens(r) for r in v):>10.0f}{st.median(r['in'] + r['cache_write'] for r in v):>10.0f}{st.median(r.get('ctx_final', 0) for r in v):>9.0f}{st.median(r['secs'] for r in v):>7.0f}")
     print()
 
 

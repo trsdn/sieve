@@ -37,33 +37,47 @@ Pure logic lives in `hooks/lib.ts` with tests in `hooks/lib.test.ts`. Everything
 
 ## How it works
 
-Built-in results (Bash, Grep, Glob, WebFetch, Read) are rewritten in place after they ran: the model sees head, tail and the failure lines of the middle, the whole output goes into a local FTS5 index, and `mcp__sieve__search` queries it. Nothing is refused and nothing needs to be learned.
+Built-in results (Bash, Grep, Glob, WebFetch, Read) are rewritten in place after they ran. Nothing is refused and the model has nothing to learn.
 
-- Up to 4000 chars (Glob: 150 paths) a result is left alone. Above 30000 it is cut. In between the decider decides, with the user's request in view:
-  - *what is it*: repetitive (listing, log, progress) or distinct (code, config, a stack trace)? Cut only if repetitive, at 0.6.
-  - *what does the request need*: every line (counting, exact lookup) or a sample? Keep whole if every line, at 0.7.
-- The decider also classifies each prompt; exploring cuts harder (x0.6), debugging less (x1.5), at confidence 0.4.
-- Thresholds come from `eval/decider_eval.py`, `eval/task_eval.py`, `eval/need_eval.py` (small hand-labelled sets, 24-36 samples each; tuned on the same data, so optimistic).
+- Up to 4000 chars (Glob: 150 paths) a result is left alone; above 30000 it is cut. In between:
+  1. **A rule** (`isRepetitive`, no model) decides whether the output is repetitive: many lines of few shapes (digits and words blanked), such as a listing, a log or progress output. Code, config and prose are never cut on size alone.
+  2. **The decider** reads the request next to the output and answers one question: does answering need every line (counting, exact lookup) or is a sample enough? Cut only on "a sample" at 0.7. No answer means keep whole.
+- A cut result becomes a **summary of its structure**, not head and tail: a directory tree with counts by extension and folder, a per-file match table for Grep, or a table of line shapes with the rare and failure lines kept verbatim. The footer gives the path of the full output, so the model can `grep`/`wc` it in one call; the output is also indexed (`mcp__sieve__search`, BM25).
+- Session capture and resume note: edited files, commands, failures, prompts and what was indexed are recorded; before a compaction a note (max 2000 chars) is stored and added to the system prompt after it.
+- Measurement: `~/.claude/sieve/usage.jsonl` records tool and result size (no content) per call; `eval/usage_report.py` shows where the bytes of real sessions are. `/sieve` shows cuts, kept chars, and wrong cuts (the same call repeated within two calls of a cut).
+- `SIEVE_DECIDER=0` turns the decider off; the rule and size limits still apply.
+
+### What was measured, and what was not
+
+| Evaluation | Result |
+| --- | --- |
+| `eval/rule_eval.mjs`: rule vs 36 real outputs | 35/36 right; the miss is a stack trace repeated three times |
+| `eval/need_eval.py`: keep whole when the request needs every line, dev prompts | 30/30 at 0.7; cut when a sample is enough 24/30 |
+| same, hold-out prompts not used to pick the threshold | 25/25 kept whole; cut only 11/25, so recall is lower than the dev set suggested |
+| `eval/decider_eval.py`, `eval/task_eval.py` | earlier question designs; kept as the record of why "repetitive" became a rule and the prompt-class factor was dropped (unproven) |
+
+Higher thresholds cut more but stopped keeping everything the request needs (0.8: 23/25 on hold-out), so 0.7 stays: a wrong cut costs a round trip, a missed cut only some bytes.
 
 ## Benchmark (`eval/bench.py`, `eval/report.py`)
 
-13 tasks on a generated project (`eval/make_fixture.py`) with large logs, data, file trees, test output and git history; 4 setups; 3 repetitions each (156 headless runs, `claude -p`). Per-task medians, summed:
+13 tasks on a generated project (`eval/make_fixture.py`) with large logs, data, file trees, test output and git history, headless `claude -p`, medians. **Incomplete**: 151 of 260 planned runs (`eval/bench_v2.jsonl`; the script resumes where it stopped).
 
-| Setup | Correct | Tokens | vs base | Cost | Turns |
-| --- | --- | --- | --- | --- | --- |
-| base (no plugin) | 100% | 611,936 | | $0.203 | 31 |
-| context-mode | 100% | 677,773 | +10.8% | $0.518 | 30 |
-| sieve, rules only | 100% | 594,406 | -2.9% | $0.162 | 30 |
-| sieve, with decider | 97% | 582,568 | -4.8% | $0.169 | 30 |
+| Setup (about 43 runs each, same tasks) | Correct | Tokens | Context at the end |
+| --- | --- | --- | --- |
+| no plugin | 100% | 42,756 | 18,844 |
+| sieve, rules only | 100% | 42,913 | 18,934 |
+| sieve, rules + decider | 100% | 37,844 | 18,937 |
 
-Read with care:
-- Each run carries about 37k tokens of fixed system prompt, so the percentages understate what happens to the variable part. Largest effects: `run-log` 57.9k -> 37.1k tokens (-36%), `tests` 66.2k -> 57.7k with the decider (rules only: no change).
-- The one "wrong" run is a keyword check missing a correct answer (it said "package", the check wanted "pkg").
-- Cost is noisy: prompt-cache hits depend on timing. Tokens and turns are steadier.
-- context-mode pays its tool descriptions in every session (about +6k tokens) and its start-up was about 134 s per fresh `-p` session against 7 s; in a long interactive session that is paid once.
-- Most tasks are solved by the model with a small command (`grep -c`), leaving nothing to cut. The decider helps only where a large output is unavoidable. Cutting a listing the task must count made the model need twice the turns until the request-aware check was added.
-- Not measured: interactive sessions, long sessions with compaction, other models, and the approval path of `execute`.
+- Where the output is large and the request does not need all of it, sieve saves tokens (`mid-find-skim` 37.8k vs 42.7k; `run-log` 37.1k vs 57.9k in the earlier run). Where the model already asks for a small output, nothing changes, which is most tasks.
+- The decider's share: about 5k tokens (-12%) over rules alone on the tasks run so far; one more check with 5 repetitions per cell is still due.
+- context-mode, 5-task check after repairing its install (1 run per cell, so no more than a sanity check): all correct, about 6.4k tokens more per session than no plugin (tool descriptions), same turns.
+- Single runs vary a lot (`tests` took 3 to 7 turns for the same setup because the model explores differently), so differences under about 10% are noise. Cost is noisy too (prompt-cache hits); tokens and turns are steadier.
+- Not measured: interactive sessions, long sessions with compaction, other models, the approval path of `execute`, wrong cuts in real use (`/sieve` counts them).
+
+### context-mode on this machine
+
+The installed context-mode 1.0.169 (the latest release) did not start cleanly: its dependency install, `npm install better-sqlite3` inside the plugin folder, aborts with an npm-internal error (`Cannot read properties of null (reading 'edgesOut')`) because of the plugin's `package.json` (`devDependencies` / `packageManager`). Nothing is ever installed, so every session retries (about 70-130 s of start-up). Installing the production dependencies with a trimmed `package.json` fixes it (10 s, then 6-7 s start-up). The first benchmark run measured the broken state; those runs are kept apart in `eval/bench_v2_context-mode-broken-install.jsonl`.
 
 ## Status
 
-Tested in live `claude -p --plugin-dir .` sessions and the benchmark above. Missing against context-mode: project-boundary path checks and per-project index separation; the compaction resume note is unit-tested but not exercised live.
+Tested in live `claude -p --plugin-dir .` sessions and the benchmarks above. Missing against context-mode: project-boundary path checks and per-project index separation. The compaction resume note is unit-tested but not exercised live.

@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 fixture, out, reps = os.path.abspath(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 only = set(sys.argv[4:])
 home = os.path.expanduser("~")
-CM = f"{home}/.claude/plugins/cache/context-mode/context-mode/1.0.169"
+CM = os.environ.get("CM_DIR", "/tmp/claude-501/cm-repaired")  # a copy of the installed plugin with its dependencies installed
 SIEVE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TAIL = " Answer in one short sentence."
 
@@ -47,7 +47,7 @@ def _longest(glob_prefix):
 TASKS.update({
     "mid-find": ("Run `find deps/pkg_7 deps/pkg_8 deps/pkg_9 deps/pkg_11 deps/pkg_12 deps/pkg_13 deps/pkg_14 -type f` and tell me how many files end in .txt.", [_txt(["pkg_7", "pkg_8", "pkg_9", "pkg_11", "pkg_12", "pkg_13", "pkg_14"])]),
     "mid-find-raw": ("Run exactly `find deps/pkg_7 deps/pkg_8 deps/pkg_9 deps/pkg_11 deps/pkg_12 deps/pkg_13 deps/pkg_14 -type f` with no pipes or filters, then count the files ending in .txt from its output.", [_txt(["pkg_7", "pkg_8", "pkg_9", "pkg_11", "pkg_12", "pkg_13", "pkg_14"])]),
-    "mid-find-skim": ("Run exactly `find deps/pkg_7 deps/pkg_8 deps/pkg_9 deps/pkg_11 deps/pkg_12 deps/pkg_13 deps/pkg_14 -type f` with no pipes or filters, then give me a rough idea of what the output shows.", ["pkg"]),
+    "mid-find-skim": ("Run exactly `find deps/pkg_7 deps/pkg_8 deps/pkg_9 deps/pkg_11 deps/pkg_12 deps/pkg_13 deps/pkg_14 -type f` with no pipes or filters, then give me a rough idea of what the output shows.", ["pkg|package"]),
     "mid-code": ("Run `cat src/mod_3?.py` and tell me which function defined in those files has the most lines.", [_longest("mod_3")]),
 })
 BASE_TOOLS = "Bash,Read,Grep,Glob"
@@ -63,27 +63,36 @@ def one(job):
     variant, task, rep = job
     flags, tools, env = VARIANTS[variant]
     prompt, expected = TASKS[task]
-    cmd = ["claude", "-p", prompt + TAIL, "--output-format", "json", "--setting-sources", "project", *flags, "--allowedTools", tools]
+    cmd = ["claude", "-p", prompt + TAIL, "--output-format", "stream-json", "--verbose", "--setting-sources", "project", *flags, "--allowedTools", tools]
     t0 = time.time()
     try:
         p = subprocess.run(cmd, cwd=fixture, capture_output=True, text=True, timeout=420, stdin=subprocess.DEVNULL, env={**os.environ, **env})
-        d = json.loads(p.stdout)
+        events = [json.loads(l) for l in p.stdout.splitlines() if l.startswith("{")]
+        d = next(e for e in events if e.get("type") == "result")
+        last = [e for e in events if e.get("type") == "assistant"][-1]["message"]["usage"]
     except Exception as e:  # a failed run is a data point, not a crash
         return {"variant": variant, "task": task, "rep": rep, "error": str(e)[:200]}
     u = d.get("usage", {})
     answer = str(d.get("result", ""))
     return {
         "variant": variant, "task": task, "rep": rep,
-        "correct": all(x.lower() in answer.lower() for x in expected),
+        "correct": all(any(alt.lower() in answer.lower() for alt in x.split("|")) for x in expected),
         "turns": d.get("num_turns"), "cost": d.get("total_cost_usd"),
         "in": u.get("input_tokens", 0), "cache_write": u.get("cache_creation_input_tokens", 0),
         "cache_read": u.get("cache_read_input_tokens", 0), "out": u.get("output_tokens", 0),
+        # what the window held at the last model call: the number that says how much room is left
+        "ctx_final": last.get("input_tokens", 0) + last.get("cache_read_input_tokens", 0) + last.get("cache_creation_input_tokens", 0),
         "secs": round(time.time() - t0, 1), "answer": answer[:160],
     }
 
 
 keep = set(os.environ.get("BENCH_VARIANTS", "").split(",")) - {""}
+done = set()
+if os.path.exists(out):
+    done = {(r["variant"], r["task"], r["rep"]) for r in map(json.loads, open(out)) if "error" not in r}
 jobs = [(v, t, r) for r in range(reps) for t in TASKS if not only or t in only for v in VARIANTS if not keep or v in keep]
+jobs = [j for j in jobs if j not in done]
+print(len(jobs), "runs to do", flush=True)
 with ThreadPoolExecutor(3) as pool, open(out, "a") as f:
     for res in pool.map(one, jobs):
         f.write(json.dumps(res) + "\n"); f.flush()

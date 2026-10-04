@@ -4,3 +4,4 @@ node_modules/
 tsconfig.json
 .claude-plugin/types/
 .scratch/
+eval/samples.json
