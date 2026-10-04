@@ -117,6 +117,7 @@ The closest to normal work: a copy of [more-itertools](https://github.com/more-i
 | side by side, ablation | sieve | 15/15 | 229,347 | 4,255 | $0.135 |
 | | sieve, decider off | 15/15 | 256,474 | 5,096 | $0.161 |
 
+- **Repeated with Claude Code 2.1.289** (3 sessions each, side by side, `eval/repo_results_v3.jsonl`): no plugin 202,387 window-turns, sieve 204,484 (+1%), both 15/15 right, same calls. The guide's earlier gain is gone: the no-plugin run itself now keeps the verbose test run small (step 1: 2 calls, 36k window-turns, as with the guide). Session cost is bimodal in both setups ($0.09 or $0.16 per session, the same windows and uncached input), so it is prompt-cache state, not the setup.
 - context-mode won the first step (verbose test run: 2 calls and 43k window-turns against 4 calls and 78k) because its start-up text makes the model write the output to a file and grep it; it lost the other steps to its overhead. The guide copies that behaviour: step 1 alone, 5 runs each, 37k against 78k window-turns, all right.
 - Without the guide sieve equals no plugin here: in a normal session the outputs that would be cut are rare.
 - **The decider's share is not shown by this session.** In the ablation it made one decision in 25 minutes and kept that output whole; the 11% between the two lines is run-to-run variance. With the guide the model asks for small outputs, so the middle band where the decider works stays almost empty. Its value is in the cases measured further down (overview questions over large output), not in this one.
@@ -153,6 +154,8 @@ The same nine questions, phrased naturally ("how many lines contain ERROR?"), re
 **Repeated with the final code, 3 repetitions, no plugin vs sieve** (`eval/long_results_v2.jsonl`): window after step 9 49,113 vs 45,737 tokens (-7%), session cost $0.343 vs $0.331, sieve right in 27/27 steps, no plugin in 25/27 (twice the model could not find the failing test because the harness cut the test output in the middle; sieve's summary keeps rare and failure lines). The gap to the first batch is the no-plugin session: it ended at 61k tokens in the first batch and 49k in the second, because the model solved some steps with smaller commands. Treat the saving as somewhere between 7% and 29% on this fixture, not as a number.
 
 Caveats: 2 repetitions per setup, one generated project, one model, one kind of task.
+
+**Repeated after the edit-repeat fix, the decider timeout and JSON summaries** (Claude Code 2.1.289, 3 repetitions, `eval/long_results_v3.jsonl`): window after step 9 84,223 (no plugin) vs 34,638 (sieve), -59%; session cost $0.970 vs $0.356; 9/9 right in every session for both. The biggest single gap is the verbose test run (step 3: +38k tokens without sieve, +1.9k with its test filter). No repeated call was restored, so no learned keep was triggered; the JSON summary handled `records.json` and the model still found the record by id from the full-output file.
 
 ### Browser test: large pages through the Playwright MCP (`eval/webbench.py`, `eval/web_report.py`)
 
