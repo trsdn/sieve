@@ -1,6 +1,22 @@
 export const RESULT_LIMIT = 6000
 export const AUTO_INDEX_LIMIT = 12000
 
+// Chosen on four prompt sets: at or above this, a lookup needs the full output.
+export const LOOKUP_AT = 0.5
+export const NEED_QUESTION = {
+  kind: {
+    type: 'choice',
+    instructions: 'Which kind of question is the request?',
+    criteria: {
+      'lookup or count': 'how many, which one, list all, find, exists, exact',
+      overview: 'what is this, summarize, describe, does it look ok, any sign of trouble',
+    },
+  },
+}
+
+export const needState = (prompt: string, tool: string, description: string, full: string): string =>
+  `Request: ${prompt}\n${tool}: ${description}\n---\n${full.slice(0, 1500)}\n…\n${full.slice(-500)}`
+
 export const sqlQuote = (s: string): string => `'${s.replaceAll("'", "''")}'`
 
 export const ftsQuery = (q: string, join: 'AND' | 'OR' = 'OR'): string =>

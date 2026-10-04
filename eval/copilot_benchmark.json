@@ -1,0 +1,46 @@
+{
+  "date": "2026-10-04",
+  "copilotCliVersion": "1.0.92-3",
+  "model": "gpt-6-luna",
+  "reasoningEffort": "high",
+  "scope": "Synthetic rules-only prototypes. Does not measure the released optional-decider path.",
+  "methodology": "Five paired repetitions per workload, fresh workspaces and sessions, identical fixtures per pair, counterbalanced variant order, strict JSON answers and tool-use audit.",
+  "original": {
+    "runs": 60,
+    "correctBaseline": 30,
+    "correctSieve": 30,
+    "workloads": 6,
+    "aggregateCumulativeInput": { "baseline": 523474, "sieve": 487806 },
+    "smallLookupMedianPairedInputChangePercent": 40.1
+  },
+  "requestAwareRegression": {
+    "runs": 30,
+    "correctBaseline": 15,
+    "correctSieve": 15,
+    "workloads": [
+      {
+        "task": "small-lookup",
+        "medianCumulativeInput": { "baseline": 14206, "sieve": 14204 },
+        "medianToolCalls": { "baseline": 1, "sieve": 1 },
+        "verified": "Five of five model-visible lookup outputs were byte-identical to baseline."
+      },
+      {
+        "task": "small-summary",
+        "medianPairedInputChangePercent": -8.7,
+        "medianToolCalls": { "baseline": 1, "sieve": 1 }
+      },
+      {
+        "task": "large-summary",
+        "medianPairedInputChangePercent": -35.2,
+        "medianToolCalls": { "baseline": 2, "sieve": 1 }
+      }
+    ]
+  },
+  "limitations": [
+    "Not a real-repository benchmark or a general performance guarantee.",
+    "Cumulative input includes prompt-cache hits on every request.",
+    "No cache reset; model/network latency and user plugins affect time and credits.",
+    "No benchmark of MCP, compaction, learned keep or multi-turn implementation tasks.",
+    "Rules-only measurements predate the production adapter and its optional-decider integration."
+  ]
+}

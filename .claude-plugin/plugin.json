@@ -1,5 +1,5 @@
 {
   "name": "sieve",
-  "version": "0.1.0",
-  "description": "Keeps raw tool output out of the context: sandboxed execution, a local FTS5 index, routing hooks and session resume, with strands-decider making the close calls."
+  "version": "0.2.0",
+  "description": "Keeps unnecessary tool output out of context in Claude Code and Copilot CLI, with a shared local strands-decider for close calls."
 }

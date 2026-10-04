@@ -1,14 +1,18 @@
 # sieve
 
-Claude Code mod (function hooks, not command hooks). Replaces `context-mode`; see README.md.
+Claude Code mod (function hooks) and Copilot CLI adapter (command hooks). The Claude mod replaces `context-mode`; see README.md.
 
 ## Layout
 - `.claude-plugin/plugin.json`: manifest. `hooks/hooks.json`: names the one module `./register.ts`.
 - `hooks/register.ts`: all hooks and anything that takes `$`.
 - `hooks/lib.ts`: pure functions, no `$`; `hooks/lib.test.ts` tests them.
+- `copilot/`: separate Copilot CLI command-hook adapter and installer. `copilot/copilot.test.mjs` runs with Node's built-in test runner.
 
 ## Rules
 - Run `claude plugin validate .` and `claude plugin test .` after every change to hooks.
+- For Copilot changes also run `node --experimental-strip-types --test copilot/copilot.test.mjs`. Use `SIEVE_LIVE_DECIDER=1` for the optional real-service check, separately from large decider evaluation sweeps so its 1.5-second deadline is meaningful.
+- Copilot's unknown-intent gate reuses `NEED_QUESTION`, `LOOKUP_AT` and `needState` from `hooks/lib.ts`. Do not silently reword or loosen it. Explicit lookups must bypass filtering and must not cost an extra tool round trip.
+- Copilot originals are project-local in `.sieve/`, which the installer gitignores. The Copilot shell-only scope is intentional; do not claim parity with Claude's MCP, search, session or effort features.
 - `$` goes only to top-level function declarations, never into closures inside `register`: the validator rejects it. Module state lives in the top-level object `S`.
 - `on('tool.call', { tool })` matchers are string literals (a computed matcher validates as `tool=?`).
 - The only tool is `mcp__sieve__search`; the prefix is `mcp__sieve__`, so renaming the plugin renames it. There is no `execute` tool (never called in any test).

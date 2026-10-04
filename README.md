@@ -1,6 +1,8 @@
 # sieve
 
-A Claude Code mod that lets the useful part of tool output through and keeps the rest out of the context. It replaces the `context-mode` plugin and adds [strands-decider](https://github.com/strands-labs/strands-decider) for the calls a fixed rule cannot make.
+A tool-output filter for Claude Code and GitHub Copilot CLI that lets the useful part through and keeps unnecessary output out of context. The Claude Code mod replaces `context-mode`; both adapters can use the shared local [strands-decider](https://github.com/strands-labs/strands-decider) for calls a fixed rule cannot make.
+
+**Copilot CLI support is new in v0.2.0 and limited to shell results.** Install and scope are described below. The results, search, session and command features in the next table describe the Claude Code adapter.
 
 ## What it does
 
@@ -30,9 +32,59 @@ Disable the old plugin: set `"context-mode@context-mode": false` in `~/.claude/s
 ```
 claude plugin validate .
 claude plugin test .
+node --experimental-strip-types --test copilot/copilot.test.mjs
 ```
 
 Pure logic lives in `hooks/lib.ts` with tests in `hooks/lib.test.ts`. Everything that takes `$` stays in `hooks/register.ts`, as top-level functions: the validator refuses `$` passed to closures.
+
+## GitHub Copilot CLI
+
+Requires **Node 22.18+ or 24+** and Copilot CLI with command-hook `modifiedResult` support. Tested with Copilot CLI **1.0.92-3**. No npm packages are needed.
+
+From this checkout or an extracted release:
+
+```sh
+node copilot/install.mjs /path/to/your/project
+cd /path/to/your/project
+copilot
+```
+
+The installer copies the runtime into `.github/sieve/`, writes only its own `.github/hooks/sieve-copilot.json`, and adds `/.sieve/` to the project's `.gitignore`. Other hook files are left alone; an unrelated file using the same name is not overwritten. The runtime is copied into the project so hooks do not need read access to a separate sieve checkout. Start a new trusted Copilot session after installation; existing sessions are not modified.
+
+The Copilot adapter:
+
+- Handles `bash` and `powershell` results for arbitrary commands, not just benchmark fixtures. It reuses sieve's test, build, install and `git log` filters; unrecognized output, code and patches remain unchanged.
+- Captures the current request via `userPromptSubmitted`. Clear detail/lookup requests keep the original output. Clear summary requests allow a recognized filter.
+- **Uses the existing shared decider** for unknown intent when a recognized filter could help. The question and the **0.5 lookup threshold** are exactly the ones used by the Claude adapter. A probability of 0.5 or higher keeps the original.
+- Never starts the decider. It contacts only `127.0.0.1:8765`, aborts after **1.5 seconds**, and applies a **30-second session cooldown** after an unavailable, malformed or timed-out reply. The failure is logged; the original output stays intact.
+- With `SIEVE_DECIDER=0`, only explicit rule-approved summaries are filtered. Missing request state or an unknown request truncated beyond 500 characters is kept rather than guessed.
+- Reads Copilot's full persisted file when a large shell result has already been spilled. Full originals remain inside the project's `.sieve/sessions/`; totals, failure diagnostics and shell completion metadata are preserved.
+- Writes size/verdict metrics to `.sieve/usage.jsonl`, with no output content in that log. Up to 500 characters of the current prompt are stored locally in the session state for the local decider. `.sieve/` must remain gitignored; originals are retained until you remove them.
+
+The shared service is optional. On macOS, its existing setup is `sh launchd/install.sh`; install/start it separately, not from a hook. Disable it for Copilot with `SIEVE_DECIDER=0 copilot`.
+
+This is not yet parity with the Claude adapter: **no MCP-result filtering, FTS search tool, `/sieve` command, learned-keep/repeat recovery, compaction notes, task-switch hints or effort changes** are provided for Copilot. Permissions are never granted or bypassed. To disable the adapter, remove `.github/hooks/sieve-copilot.json`; captured files are left in place.
+
+### Copilot measurements
+
+The local prototype was evaluated in **60 fresh sessions** (six workloads, five paired repetitions, GPT-6 Luna/high). All 60 answers were correct, but filtering a small exact lookup cost **40.1% more cumulative input tokens** because it removed the sought detail. The request-aware fix was then evaluated in **30 new sessions** (three workloads, five paired repetitions); all 30 answers were correct:
+
+| Task | Median paired cumulative-input change | Tool calls, baseline / sieve |
+| --- | --- | --- |
+| Small exact lookup | approximately 0% | 1 / 1 |
+| Small test summary | -8.7% | 1 / 1 |
+| Large test summary | -35.2% | 2 / 1 |
+
+These are **synthetic, rules-only prototype measurements, not a benchmark of the newly added Copilot decider path or a real repository**. Cumulative input includes cached input on every model request; it is not the same as billing. Aggregate metrics are in `eval/copilot_benchmark.json`. Do not infer general speed/cost savings from this small task mix.
+
+The release adapter's installer, safe fallback and real shared-decider path are checked separately:
+
+```sh
+SIEVE_LIVE_DECIDER=1 node --experimental-strip-types --test copilot/copilot.test.mjs
+node eval/copilot_smoke.mjs
+```
+
+The smoke test uses fresh projects under `~/dev/sieve-bench-runs/`, exercises real Copilot command hooks, and removes those projects' hook configurations afterward. It does not change global Copilot settings.
 
 ## How it works
 

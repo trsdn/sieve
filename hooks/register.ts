@@ -1,6 +1,8 @@
 import type { Register } from 'claude-code'
 import {
   LIMITS,
+  LOOKUP_AT,
+  NEED_QUESTION,
   buildSnapshot,
   chunkText,
   compactText,
@@ -8,6 +10,7 @@ import {
   ftsQuery,
   isRepetitive,
   judgeSize,
+  needState,
   projectKey,
   signature,
   sqlQuote,
@@ -17,9 +20,6 @@ import {
 
 const PORT = 8765
 const DECIDER = `http://127.0.0.1:${PORT}/v1/systemone`
-// At or above this, the request is a lookup or a count, and the output stays whole.
-// Chosen on four prompt sets (125 requests that need the whole output, none cut); see eval/need_eval2.py and need_eval3.py.
-const LOOKUP_AT = 0.5
 const SEARCH = 'mcp__sieve__search'
 const KEEP_DAYS = 14
 // New topic: suggest a reset only when the decider is this sure (no follow-up was ever called new at 0.8,
@@ -231,16 +231,7 @@ async function learnWrongCut($: any, sig: string) {
 // already said the output is repetitive; code and prose never get here.
 async function needsEveryLine($: any, e: any, full: string): Promise<boolean> {
   if (!S.prompt) return true
-  const answers = await ask($, `Request: ${S.prompt}\n${e.tool}: ${describe(e)}\n---\n${full.slice(0, 1500)}\n…\n${full.slice(-500)}`, {
-    kind: {
-      type: 'choice',
-      instructions: 'Which kind of question is the request?',
-      criteria: {
-        'lookup or count': 'how many, which one, list all, find, exists, exact',
-        overview: 'what is this, summarize, describe, does it look ok, any sign of trouble',
-      },
-    },
-  })
+  const answers = await ask($, needState(S.prompt, e.tool, describe(e), full), NEED_QUESTION)
   const p = answers?.kind?.probabilities?.['lookup or count']
   S.asked += 1
   // No answer means keep it whole: a wrong cut costs a round trip, a missed cut only some bytes.
