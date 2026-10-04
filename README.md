@@ -35,12 +35,35 @@ claude plugin test .
 
 Pure logic lives in `hooks/lib.ts` with tests in `hooks/lib.test.ts`. Everything that takes `$` stays in `hooks/register.ts`, as top-level functions: the validator refuses `$` passed to closures.
 
+## How it works
+
+Built-in results (Bash, Grep, Glob, WebFetch, Read) are rewritten in place after they ran: the model sees head, tail and the failure lines of the middle, the whole output goes into a local FTS5 index, and `mcp__sieve__search` queries it. Nothing is refused and nothing needs to be learned.
+
+- Up to 4000 chars (Glob: 150 paths) a result is left alone. Above 30000 it is cut. In between the decider decides, with the user's request in view:
+  - *what is it*: repetitive (listing, log, progress) or distinct (code, config, a stack trace)? Cut only if repetitive, at 0.6.
+  - *what does the request need*: every line (counting, exact lookup) or a sample? Keep whole if every line, at 0.7.
+- The decider also classifies each prompt; exploring cuts harder (x0.6), debugging less (x1.5), at confidence 0.4.
+- Thresholds come from `eval/decider_eval.py`, `eval/task_eval.py`, `eval/need_eval.py` (small hand-labelled sets, 24-36 samples each; tuned on the same data, so optimistic).
+
+## Benchmark (`eval/bench.py`, `eval/report.py`)
+
+13 tasks on a generated project (`eval/make_fixture.py`) with large logs, data, file trees, test output and git history; 4 setups; 3 repetitions each (156 headless runs, `claude -p`). Per-task medians, summed:
+
+| Setup | Correct | Tokens | vs base | Cost | Turns |
+| --- | --- | --- | --- | --- | --- |
+| base (no plugin) | 100% | 611,936 | | $0.203 | 31 |
+| context-mode | 100% | 677,773 | +10.8% | $0.518 | 30 |
+| sieve, rules only | 100% | 594,406 | -2.9% | $0.162 | 30 |
+| sieve, with decider | 97% | 582,568 | -4.8% | $0.169 | 30 |
+
+Read with care:
+- Each run carries about 37k tokens of fixed system prompt, so the percentages understate what happens to the variable part. Largest effects: `run-log` 57.9k -> 37.1k tokens (-36%), `tests` 66.2k -> 57.7k with the decider (rules only: no change).
+- The one "wrong" run is a keyword check missing a correct answer (it said "package", the check wanted "pkg").
+- Cost is noisy: prompt-cache hits depend on timing. Tokens and turns are steadier.
+- context-mode pays its tool descriptions in every session (about +6k tokens) and its start-up was about 134 s per fresh `-p` session against 7 s; in a long interactive session that is paid once.
+- Most tasks are solved by the model with a small command (`grep -c`), leaving nothing to cut. The decider helps only where a large output is unavoidable. Cutting a listing the task must count made the model need twice the turns until the request-aware check was added.
+- Not measured: interactive sessions, long sessions with compaction, other models, and the approval path of `execute`.
+
 ## Status
 
-Tested in live `claude -p --plugin-dir .` sessions: `execute` (shell, python), `index`, `search`, `fetch` and `batch` work; the routing hooks (one-time nudge for bulky Bash, `curl`/`WebFetch` refusal) work; the shared decider service answers (the mod only checks it, every 30 s at most).
-
-Known limits:
-- The decider is conservative. On a handful of probes `find /` scored only 0.25 for "bulky" and most prompts classified below 0.8, so at the current thresholds the fixed rules do almost all of the routing. The thresholds are not tuned.
-- `execute` returns head and tail up to 6000 chars, which saves little on small outputs.
-- When a command needs approval, `execute` hands it to the real Bash tool; that path (the dialog) was not exercised headlessly.
-- Missing against context-mode: project-boundary path checks, per-project index separation, compaction resume not exercised live.
+Tested in live `claude -p --plugin-dir .` sessions and the benchmark above. Missing against context-mode: project-boundary path checks and per-project index separation; the compaction resume note is unit-tested but not exercised live.
