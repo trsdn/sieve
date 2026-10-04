@@ -104,6 +104,26 @@ The same nine questions, phrased naturally ("how many lines contain ERROR?"), re
 
 Caveats: 2 repetitions per setup, one generated project, one model, one kind of task.
 
+### Browser test: large pages through the Playwright MCP (`eval/webbench.py`, `eval/web_report.py`)
+
+The case context-mode's README is about: a 20-40 KB page that arrives as a snapshot. Two generated pages (450 order rows, 140 changelog entries), three questions that need all rows, served locally; the model reads them through the Playwright MCP and picks its own method. 3 repetitions per cell, 36 runs per table; "context-mode-told" adds one sentence to the prompt asking the model to use the `ctx_*` tools (a diagnostic, not a fair free-choice setup). Results in `eval/web_results.jsonl` and `eval/web_snapshot_results.jsonl`.
+
+**With page scripting allowed** (`browser_evaluate` available): every setup, including no plugin, answers by running a small script inside the page, so the raw rows never reach the context. All 36 runs correct; tokens no plugin 100k, sieve 100k, context-mode 119k, context-mode-told 121k. Zero `ctx_*` calls in any setup, even when told: the browser tool already does the job. context-mode's method ("think in code") is what the model does anyway here.
+
+**With `browser_evaluate` blocked** (the model must read the snapshot):
+
+| Setup | Correct | Tokens | Context at the end | `ctx_*` calls |
+| --- | --- | --- | --- | --- |
+| no plugin | 100% | 103,390 | 32,265 | 0 |
+| context-mode, free choice | 100% | 161,557 | 47,232 | 0 |
+| context-mode, told to use its tools | 100% | 102,210 | 27,710 | 18 |
+| sieve | 100% | 122,411 | 33,188 | 0 |
+
+- When the model uses the `ctx_*` tools the saving is real: the end context is 14% below no plugin, and on the question that needs a computation over every row (`orders-over-500`) tokens drop from 145k to 101k (-31%). So the README's claim holds for the case it describes **if the tools are used**.
+- Left to itself the model did not use them (0 calls), and then context-mode was clearly worse than no plugin here (+56% tokens, +15k tokens of end context; why the end context is larger was not investigated).
+- Over all three questions the told setup only breaks even with no plugin on tokens (102k vs 103k): the saving appears on the compute-heavy question and vanishes on the others.
+- sieve does not touch MCP results or reads under 80,000 characters, so it should equal no plugin here; it ran 18% above on tokens, driven by one question (`top-customer`) where the model took a different route in 3 runs. Read that as variance, not as an effect. It also means sieve gives no help for this case.
+
 ### context-mode on this machine
 
 The installed context-mode 1.0.169 (the latest release) did not start cleanly: its dependency install, `npm install better-sqlite3` inside the plugin folder, aborts with an npm-internal error (`Cannot read properties of null (reading 'edgesOut')`) because of the plugin's `package.json` (`devDependencies` / `packageManager`). Nothing is ever installed, so every session retries (about 70-130 s of start-up). Installing the production dependencies with a trimmed `package.json` fixes it (10 s, then 6-7 s start-up). The first benchmark run measured the broken state; those runs are kept apart in `eval/bench_v2_context-mode-broken-install.jsonl`.
