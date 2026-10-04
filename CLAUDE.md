@@ -14,5 +14,5 @@ Claude Code mod (function hooks, not command hooks). Replaces `context-mode`; se
 - The tool prefix is `mcp__sieve__`; renaming the plugin renames every tool.
 - A capture or snapshot failure must never break a tool call: wrap in try/catch and carry on.
 - The decider is optional. Every use has a rule-based fallback and a confidence threshold (0.9 for bulky commands, 0.8 for prompt class).
-- Do not run `strands-decider` per call (it loads a 2B model); use the served instance on port 8765.
+- The decider is one shared LaunchAgent (`launchd/`); the mod never starts it. Do not run `strands-decider` per call (it loads a 2B model).
 - The mod API is early access and moves; the declaration file written by the skill is the authority.

@@ -13,7 +13,6 @@ import {
 } from './lib'
 
 const PORT = 8765
-const CHECKPOINT = 'StrandsAgents/strands-decider-2B-hobson-v19'
 const DECIDER = `http://127.0.0.1:${PORT}/v1/systemone`
 const TOOL = (name: string) => `mcp__sieve__${name}`
 
@@ -27,7 +26,7 @@ const TASKS = {
   question: 'a short question that needs an answer, not tool work',
 }
 
-const S = { inner: false, session: '', db: '', deciderReady: false, kept: 0, indexed: 0, nudged: new Set<string>() }
+const S = { checkedAt: 0, inner: false, session: '', db: '', deciderReady: false, kept: 0, indexed: 0, nudged: new Set<string>() }
 
 async function sql($: any, script: string) {
   const ran = await $.process.run(['sqlite3', S.db], { stdin: script, timeoutMs: 60000 })
@@ -100,8 +99,20 @@ async function search($: any, queries: string[], limit = 3): Promise<string> {
   return out.join('\n\n')
 }
 
+async function deciderUp($: any): Promise<boolean> {
+  const now = await $.clock.now()
+  if (S.deciderReady || now - S.checkedAt < 30000) return S.deciderReady
+  S.checkedAt = now
+  try {
+    S.deciderReady = (await $.http.fetch(`http://127.0.0.1:${PORT}/docs`)).ok
+  } catch {
+    S.deciderReady = false
+  }
+  return S.deciderReady
+}
+
 async function ask($: any, state: string, questions: Record<string, unknown>) {
-  if (!S.deciderReady) return undefined
+  if (!(await deciderUp($))) return undefined
   try {
     const res = await $.http.fetch(DECIDER, {
       method: 'POST',
@@ -193,32 +204,8 @@ export const register: Register = (on, options) => {
     })
     await $.command.register({ name: 'sieve', description: 'sieve: index size and decider status' })
 
-    // The decider model loads once, here, and serves the whole session. A second session
-    // finds the port taken and shares the first one's server.
-    void (async () => {
-      const bin = `${home}/.local/bin/strands-decider`
-      const server = $.process.spawn({
-        argv: [bin, 'serve', CHECKPOINT, '--device', 'mlx', '--port', String(PORT)],
-      })
-      void (async () => {
-        for (let i = 0; i < 60 && !S.deciderReady; i++) {
-          await $.clock.sleep(2000)
-          try {
-            S.deciderReady = (await $.http.fetch(`http://127.0.0.1:${PORT}/docs`)).ok
-          } catch {
-            S.deciderReady = false
-          }
-        }
-      })()
-      try {
-        for await (const _ of server) {
-          // drained so the child keeps running; its logs are not needed
-        }
-      } catch {
-        // could not start: the rules still route, the decider just stays off
-      }
-      S.deciderReady = false
-    })()
+    // The decider is a shared service on this machine (see launchd/); nothing starts it here.
+    void deciderUp($)
 
     return next(e)
   })

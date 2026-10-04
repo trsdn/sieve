@@ -8,7 +8,7 @@ A Claude Code mod that lets the useful part of tool output through and keeps the
 | --- | --- |
 | Tools | `mcp__sieve__execute`, `batch`, `index`, `fetch`, `search`. Code runs in a sandbox, output over 6000 chars is indexed (SQLite FTS5) and cut to head and tail. |
 | Routing | `curl`/`wget` and `WebFetch` are refused in favour of `fetch`. Bash commands that will print a lot get a one-time nudge; output over 12000 chars is indexed afterwards. |
-| Decider | A local `strands-decider serve` (MLX, port 8765) judges "will this command print more than 200 lines?" and classifies each prompt (explore, debug, implement, review, question). Below 0.9 / 0.8 confidence the fixed rules decide alone. |
+| Decider | One shared `strands-decider serve` (MLX, 127.0.0.1:8765, a LaunchAgent, see `launchd/`) judges "will this command print more than 200 lines?" and classifies each prompt (explore, debug, implement, review, question). Below 0.9 / 0.8 confidence the fixed rules decide alone. |
 | Session | Edited files, commands, failures and prompts are recorded; before a compaction a resume note (max 2000 chars) is stored and added to the system prompt afterwards. |
 | Permissions | `execute`, `batch` and `index` run only when your Bash/Read rules say `allow`. |
 | Command | `/sieve` shows index size, chars kept out of context, decider status. |
@@ -16,7 +16,7 @@ A Claude Code mod that lets the useful part of tool output through and keeps the
 ## Requirements
 
 - Claude Code with function-hook mods (`plugin-authoring`), `sqlite3` with FTS5, `node`, `python3`
-- `strands-decider` with the `mlx` extra at `~/.local/bin/strands-decider` (optional; without it only the rules route)
+- `strands-decider` with the `mlx` extra at `~/.local/bin/strands-decider`, run as a shared service: `sh launchd/install.sh` (optional; without it only the rules route)
 
 ## Install
 
@@ -37,7 +37,7 @@ Pure logic lives in `hooks/lib.ts` with tests in `hooks/lib.test.ts`. Everything
 
 ## Status
 
-Tested in live `claude -p --plugin-dir .` sessions: `execute` (shell, python), `index`, `search`, `fetch` and `batch` work; the routing hooks (one-time nudge for bulky Bash, `curl`/`WebFetch` refusal) work; the mod starts and stops its own decider server (ready in about 9 s).
+Tested in live `claude -p --plugin-dir .` sessions: `execute` (shell, python), `index`, `search`, `fetch` and `batch` work; the routing hooks (one-time nudge for bulky Bash, `curl`/`WebFetch` refusal) work; the shared decider service answers (the mod only checks it, every 30 s at most).
 
 Known limits:
 - The decider is conservative. On a handful of probes `find /` scored only 0.25 for "bulky" and most prompts classified below 0.8, so at the current thresholds the fixed rules do almost all of the routing. The thresholds are not tuned.
