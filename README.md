@@ -72,7 +72,23 @@ Higher thresholds cut more but stopped keeping everything the request needs (0.8
 - The decider's share: about 5k tokens (-12%) over rules alone on the tasks run so far; one more check with 5 repetitions per cell is still due.
 - context-mode, 5-task check after repairing its install (1 run per cell, so no more than a sanity check): all correct, about 6.4k tokens more per session than no plugin (tool descriptions), same turns.
 - Single runs vary a lot (`tests` took 3 to 7 turns for the same setup because the model explores differently), so differences under about 10% are noise. Cost is noisy too (prompt-cache hits); tokens and turns are steadier.
-- Not measured: interactive sessions, long sessions with compaction, other models, the approval path of `execute`, wrong cuts in real use (`/sieve` counts them).
+- Not measured: interactive sessions, sessions long enough to compact, other models, the approval path of `execute`, wrong cuts in real use (`/sieve` counts them).
+
+### Long session (`eval/longbench.py`, `eval/long_report.py`)
+
+One session per setup, nine steps one after another (`--resume`): eight commands with large, unavoidable output (the prompt names the exact command, no pipes), then a recall question ("which test failed earlier, expected and actual?"). 2 repetitions per setup, so 6 sessions; results in `eval/long_results.jsonl`.
+
+| Setup | Window after step 1 | after step 5 | after step 9 | Session cost | Right |
+| --- | --- | --- | --- | --- | --- |
+| no plugin | 19,856 | 55,299 | 61,153 | $0.452 | 9/9 |
+| context-mode (repaired) | 23,414 | 55,568 | 71,012 | $0.479 | 9/9 |
+| sieve | 19,124 | 40,278 | 43,450 | $0.319 | 9/9 |
+
+sieve ends the session with a window 29% smaller than no plugin and a session 29% cheaper; all nine steps were right in every session, including the recall question, so the cuts did not cost the model what it needed. context-mode ends 16% above no plugin.
+
+Why context-mode does not help here, as far as the traces show: in two probe runs the model made only plain Bash and Grep calls and never a `ctx_*` call, so context-mode contributed its fixed cost (about 3-6k tokens of tool descriptions and routing text) and no cuts. Its method depends on the model choosing its tools, and a prompt that dictates the command overrides that. These prompts dictate the command by design (so large output cannot be avoided), which is not how context-mode is meant to be used: this test favours a transparent approach, and a fairer test for context-mode would let the model pick its own commands. Not run.
+
+Caveats: 2 repetitions per setup, one generated project, one model, one kind of task.
 
 ### context-mode on this machine
 
