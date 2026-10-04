@@ -8,9 +8,11 @@ import {
   ftsQuery,
   isRepetitive,
   judgeSize,
+  projectKey,
   signature,
   sqlQuote,
   summarize,
+  summarizeJson,
 } from './lib'
 
 const PORT = 8765
@@ -34,6 +36,9 @@ const GUIDE = 'Tool output stays in every later request, so ask commands for the
 // Command filters apply from this size on; a type of call cut wrongly this often is never cut again.
 const FILTER_MIN = 2000
 const WRONG_LIMIT = 2
+// A decider that does not answer in time counts as down: it must never hold up a prompt or a tool call.
+const DECIDER_MS = 1500
+const MUTATING = ['Edit', 'Write', 'NotebookEdit']
 
 const text = (t: string) => ({ result: [{ type: 'text', text: t }] })
 
@@ -115,13 +120,23 @@ async function search($: any, queries: string[], limit = 3): Promise<string> {
   return out.join('\n\n')
 }
 
+// $.http.fetch has no timeout of its own: undefined when the answer takes longer than DECIDER_MS.
+async function fetchWithin($: any, url: string, init?: Record<string, unknown>) {
+  return Promise.race([$.http.fetch(url, init), $.clock.sleep(DECIDER_MS).then(() => undefined)])
+}
+
+async function markDown($: any) {
+  S.deciderReady = false
+  S.checkedAt = await $.clock.now()
+}
+
 async function deciderUp($: any): Promise<boolean> {
   if (!S.useDecider) return false
   const now = await $.clock.now()
   if (S.deciderReady || now - S.checkedAt < 30000) return S.deciderReady
   S.checkedAt = now
   try {
-    S.deciderReady = (await $.http.fetch(`http://127.0.0.1:${PORT}/docs`)).ok
+    S.deciderReady = (await fetchWithin($, `http://127.0.0.1:${PORT}/health`))?.ok === true
   } catch {
     S.deciderReady = false
   }
@@ -131,14 +146,19 @@ async function deciderUp($: any): Promise<boolean> {
 async function ask($: any, state: string, questions: Record<string, unknown>) {
   if (!(await deciderUp($))) return undefined
   try {
-    const res = await $.http.fetch(DECIDER, {
+    const res = await fetchWithin($, DECIDER, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ state, questions }),
     })
+    if (!res) {
+      // hung or slow: off for 30 s, then checked again
+      await markDown($)
+      return undefined
+    }
     return res.ok ? (JSON.parse(res.text).answers as Record<string, any>) : undefined
   } catch {
-    S.deciderReady = false
+    await markDown($)
     return undefined
   }
 }
@@ -286,8 +306,13 @@ async function logUsage($: any, line: Record<string, unknown>) {
 }
 
 // A cut followed within two calls by the same call again was a wrong cut: the repeat gets the
-// whole output, and the type of call is remembered across sessions.
+// whole output, and the type of call is remembered across sessions. An edit in between makes the
+// repeat a new measurement (pytest, Edit, pytest), not a wrong cut.
 function watchRepeat(e: any): string | undefined {
+  if (MUTATING.includes(e.tool)) {
+    S.cuts = []
+    return undefined
+  }
   const what = describe(e)
   let hit: string | undefined
   for (const c of S.cuts) {
@@ -329,10 +354,12 @@ async function compact($: any, e: any, ran: any): Promise<any | undefined> {
   const filtered = e.tool === 'Bash' && full.length > FILTER_MIN ? filterCommand(String(e.command), full) : undefined
   const size = e.tool === 'Glob' ? r.filenames.length : full.length
   const verdict = filtered ? 'filter' : judgeSize(key, size, ran.isError === true, 1)
-  const repetitive = e.tool === 'Glob' || isRepetitive(full)
+  // JSON is data, never code: it gets a schema summary and counts as repetitive for the decider.
+  const json = filtered || size <= (LIMITS[key]?.soft ?? Infinity) ? undefined : summarizeJson(full)
+  const repetitive = e.tool === 'Glob' || json !== undefined || isRepetitive(full)
   let cut = verdict === 'compact' || verdict === 'filter'
   if (verdict === 'ask' && repetitive) cut = !(await needsEveryLine($, e, full))
-  await logUsage($, { tool: key === 'mcp' ? 'mcp' : e.tool, sig, size, verdict, repetitive, cut })
+  await logUsage($, { tool: key === 'mcp' ? 'mcp' : e.tool, sig, size, verdict, repetitive, json: json !== undefined, cut })
   if (!cut) return undefined
 
   const source = `${e.tool}:${(await $.clock.now()).toString(36)}${++S.seen}`.replace(/[^\w.:-]/g, '_')
@@ -341,7 +368,7 @@ async function compact($: any, e: any, ran: any): Promise<any | undefined> {
     await $.fs.write(path, full)
   }
   const foot = `[sieve: ${full.length} chars summarised. Full output: ${path}. For exact counts or lookups run grep/wc/awk on that file; ${SEARCH} finds passages. Repeat the same call to get everything.]`
-  const short = filtered ? `${filtered}\n${foot}` : repetitive ? `${summarize(e.tool, full)}\n${foot}` : `${compactText(full, { head: 1800, tail: 1200, signal: 15 })}\n${foot}`
+  const short = filtered ? `${filtered}\n${foot}` : json ? `${json}\n${foot}` : repetitive ? `${summarize(e.tool, full)}\n${foot}` : `${compactText(full, { head: 1800, tail: 1200, signal: 15 })}\n${foot}`
   await index($, source, full)
   await record($, 'cut', `${source} ${describe(e)}`)
   S.cuts.push({ what: describe(e), sig, left: 2 })
@@ -357,9 +384,10 @@ export const register: Register = on => {
     S.useDecider = (await $.env.get('SIEVE_DECIDER')) !== '0'
     S.guide = (await $.env.get('SIEVE_GUIDE')) !== '0'
     S.useEffort = (await $.env.get('SIEVE_EFFORT')) !== '0'
+    // The harness's own slug for its projects folder (S.out must match it); the index gets a collision-free key.
     const slug = e.cwd.replace(/[/.]/g, '-')
     S.dir = `${home}/.claude/sieve`
-    S.db = `${S.dir}/${slug}.db`
+    S.db = `${S.dir}/${projectKey(e.cwd)}.db`
     S.session = await $.session.id()
     // The harness's own folder for long outputs: the model may read it without asking.
     S.out = `${home}/.claude/projects/${slug}/${S.session}/tool-results`
@@ -479,7 +507,12 @@ delete from events where ts < ${cutoff};`,
       }
       if (prior >= 2 && (await isNewTask($, text))) {
         S.switches += 1
-        $.ui.toast('sieve: this looks like a new task. /clear (or /compact) would keep the earlier work out of every request.')
+        // Effort stays low for the session (changing it breaks the cache); /clear is the clean place to reset it.
+        $.ui.toast(
+          S.effort === 'low'
+            ? 'sieve: this looks like a new task, and this session runs at low effort. /clear keeps the earlier work out of every request and restores normal effort.'
+            : 'sieve: this looks like a new task. /clear (or /compact) would keep the earlier work out of every request.',
+        )
         await logUsage($, { event: 'new-task' })
       }
       if (S.guide && (await needsReminder($, text))) {

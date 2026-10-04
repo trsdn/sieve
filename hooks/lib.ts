@@ -357,3 +357,82 @@ export const filterCommand = (command: string, text: string): string | undefined
   }
   return out && out.length < text.length * 0.7 ? out : undefined
 }
+
+// ---- project key ----------------------------------------------------------------------------
+
+// "/a/b.c" and "/a/b-c" give the same slug; the folder name plus a hash of the whole path do not.
+export const projectKey = (cwd: string): string => {
+  let h = 0x811c9dc5
+  for (let i = 0; i < cwd.length; i++) h = Math.imul(h ^ cwd.charCodeAt(i), 0x01000193) >>> 0
+  const base = (cwd.split('/').filter(Boolean).pop() ?? 'root').replace(/[^\w.-]/g, '_').slice(0, 40)
+  return `${base}-${h.toString(16).padStart(8, '0')}`
+}
+
+// ---- JSON: schema, counts and outliers instead of lines --------------------------------------
+
+const typeOf = (v: unknown): string => (v === null ? 'null' : Array.isArray(v) ? 'array' : typeof v)
+
+const show = (v: unknown, n = 160): string => clip(JSON.stringify(v), n)
+
+// An array of objects as a table: fields with type and presence, value counts for fields with few
+// values, ranges for numbers, a few rows from the start and the rows that stand out.
+const describeRows = (rows: Record<string, unknown>[], label: string): string => {
+  const fields = new Map<string, { types: Set<string>; n: number; values: Map<string, number>; min: number; max: number }>()
+  for (const r of rows) {
+    for (const [k, v] of Object.entries(r)) {
+      let f = fields.get(k)
+      if (!f) fields.set(k, (f = { types: new Set(), n: 0, values: new Map(), min: Infinity, max: -Infinity }))
+      f.types.add(typeOf(v))
+      f.n += 1
+      if (typeof v === 'number') {
+        f.min = Math.min(f.min, v)
+        f.max = Math.max(f.max, v)
+      }
+      if (typeof v === 'string' || typeof v === 'boolean' || v === null) {
+        const key = String(v).slice(0, 60)
+        if (f.values.size <= 30 || f.values.has(key)) f.values.set(key, (f.values.get(key) ?? 0) + 1)
+      }
+    }
+  }
+  const lines = [`${label}: ${rows.length} objects, ${fields.size} fields`]
+  // A field's rare values mark the rows worth showing (status "failed" among thousands of "ok").
+  const rare: [string, string][] = []
+  for (const [k, f] of [...fields.entries()].slice(0, 40)) {
+    const presence = f.n < rows.length ? `, in ${f.n}` : ''
+    const range = f.min <= f.max ? `, ${f.min}..${f.max}` : ''
+    lines.push(`  ${k}: ${[...f.types].join('|')}${presence}${range}`)
+    if (f.values.size >= 2 && f.values.size <= 12) {
+      const counts = top(f.values, 12)
+      lines.push(`    ${counts.map(([v, n]) => `${v} ${n}`).join(', ')}`)
+      for (const [v, n] of counts) if (n <= Math.max(1, rows.length * 0.05)) rare.push([k, v])
+    }
+  }
+  lines.push('first rows:', ...rows.slice(0, 3).map(r => `  ${show(r)}`))
+  const odd = rows.filter((r, i) => i >= 3 && rare.some(([k, v]) => String(r[k]).slice(0, 60) === v)).slice(0, 5)
+  if (odd.length) lines.push('rows with rare values:', ...odd.map(r => `  ${show(r)}`))
+  return lines.join('\n')
+}
+
+const isRowArray = (v: unknown): v is Record<string, unknown>[] =>
+  Array.isArray(v) && v.length > 0 && v.every(x => typeOf(x) === 'object')
+
+// A summary of a JSON document, or undefined when the text is not JSON (or is small and flat).
+export const summarizeJson = (text: string): string | undefined => {
+  const t = text.trim()
+  if (!/^[[{]/.test(t)) return undefined
+  let doc: unknown
+  try {
+    doc = JSON.parse(t)
+  } catch {
+    return undefined
+  }
+  if (isRowArray(doc)) return describeRows(doc, 'JSON array')
+  if (Array.isArray(doc)) return `JSON array: ${doc.length} items of ${[...new Set(doc.map(typeOf))].join('|')}\nfirst: ${show(doc.slice(0, 5), 400)}\nlast: ${show(doc.slice(-3), 300)}`
+  if (typeOf(doc) !== 'object') return undefined
+  // An object: its keys, and the largest array of objects in it as a table (a list response's "items").
+  const obj = doc as Record<string, unknown>
+  const keys = Object.entries(obj).map(([k, v]) => `  ${k}: ${Array.isArray(v) ? `array(${v.length})` : typeOf(v) === 'object' ? `object(${Object.keys(v as object).length} keys)` : show(v, 80)}`)
+  const arrays = Object.entries(obj).filter(([, v]) => isRowArray(v)).sort((a, b) => (b[1] as unknown[]).length - (a[1] as unknown[]).length)
+  const head = `JSON object, ${keys.length} keys:\n${keys.slice(0, 40).join('\n')}`
+  return arrays.length ? `${head}\n${describeRows(arrays[0]![1] as Record<string, unknown>[], `.${arrays[0]![0]}`)}` : head
+}

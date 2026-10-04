@@ -6,12 +6,11 @@ A Claude Code mod that lets the useful part of tool output through and keeps the
 
 | Part | What |
 | --- | --- |
-| Tools | `mcp__sieve__execute`, `batch`, `index`, `fetch`, `search`. Code runs in a sandbox, output over 6000 chars is indexed (SQLite FTS5) and cut to head and tail. |
-| Routing | `curl`/`wget` and `WebFetch` are refused in favour of `fetch`. Bash commands that will print a lot get a one-time nudge; output over 12000 chars is indexed afterwards. |
-| Decider | One shared `strands-decider serve` (MLX, 127.0.0.1:8765, a LaunchAgent, see `launchd/`) judges "will this command print more than 200 lines?" and classifies each prompt (explore, debug, implement, review, question). Below 0.9 / 0.8 confidence the fixed rules decide alone. |
+| Results | Bash, Grep, Glob, WebFetch, text MCP results and Playwright snapshot reads are rewritten in place after they ran: large ones become a structural summary, the whole output goes to a file and an SQLite FTS5 index. Nothing is refused. |
+| Tool | `mcp__sieve__search` (BM25 over what was cut). |
+| Decider | One shared `strands-decider serve` (MLX, 127.0.0.1:8765, a LaunchAgent, see `launchd/`) makes the small calls a rule cannot: lookup or overview, new task, reminder, effort. It answers within 1.5 s or counts as down for 30 s; without it only the rules decide. |
 | Session | Edited files, commands, failures and prompts are recorded; before a compaction a resume note (max 2000 chars) is stored and added to the system prompt afterwards. |
-| Permissions | `execute`, `batch` and `index` run only when your Bash/Read rules say `allow`. |
-| Command | `/sieve` shows index size, chars kept out of context, decider status. |
+| Command | `/sieve` shows cuts, chars kept out of context, index size, decider status. |
 
 ## Requirements
 
@@ -48,11 +47,12 @@ Results of Bash, Grep, Glob, WebFetch, any MCP tool that returns text, and Playw
 - Above 30000 chars Bash and Grep results are cut without asking (the harness caps them anyway). MCP results and snapshot reads are never cut blind, up to 1 MB: a blind cut gave wrong answers in the browser test.
 - **Known commands get their own filter** (the RTK idea, inside the mod): test runners keep failures with their block, skips, warnings and totals and drop passing lines; `git log` becomes one line per commit (a patch is never filtered); installs and builds keep warnings, errors and the closing summary. Unnamed test scripts are recognised by their output. Applied from 2000 chars, without the decider.
 - A command that fails comes back from Claude Code as text already cut in the middle (about 10,000 chars), where failures usually are; sieve cannot recover that part, it can only filter what is left. The guide exists to avoid this case.
-- **Learned keep**: a call that is repeated right after a cut counts as a wrong cut for its type (`git log`, `python -m pytest`, a tool name); after two, that type is never cut again, across sessions (`$.store`).
+- **Learned keep**: a call that is repeated right after a cut counts as a wrong cut for its type (`git log`, `python -m pytest`, a tool name); after two, that type is never cut again, across sessions (`$.store`). An Edit, Write or NotebookEdit in between makes the repeat a new measurement, not a wrong cut (`pytest`, fix, `pytest` is the normal loop).
+- **JSON** (a Bash or MCP result that parses) becomes a schema: fields with type, presence and number ranges, value counts for fields with few values, the first rows and the rows with rare values (`status: failed` among thousands of `ok`). For an object, its keys and its largest array of objects as such a table. It counts as data, so the decider weighs it like a repetitive result.
 - A cut result becomes a **summary of its structure**: a directory tree with counts by extension and folder, a per-file match table for Grep, or a table of line shapes with the rare and failure lines kept verbatim. The footer names the file with the whole output, so the model can `grep`/`wc` it; the output is also indexed (`mcp__sieve__search`, BM25).
 - **A repeated call** within two calls of a cut gets the whole output: the repeat is the signal that the cut was wrong.
 - The full output is written to `~/.claude/projects/<project>/<session>/tool-results/sieve-*.txt`, the harness's own folder, because the model can read it there with narrow permissions (tested with `Bash(grep:*)` only: 3.5 MB of Grep output became 3 KB and the model counted 39,946 matches in the file).
-- The index is one SQLite file per project (`~/.claude/sieve/<project>.db`); rows and files older than 14 days are deleted at session start.
+- The index is one SQLite file per project (`~/.claude/sieve/<folder>-<hash of the path>.db`; the hash avoids the slug collision of `/a/b.c` and `/a/b-c`); rows and files older than 14 days are deleted at session start.
 - Session capture and resume note: edited files, commands, failures, prompts and what was indexed; before a compaction a note (max 2000 chars) is stored and added to the system prompt after it.
 - Measurement: `~/.claude/sieve/usage.jsonl` (tool, size, verdict; no content), `eval/usage_report.py`; `/sieve` shows cuts, chars kept out, repeated calls restored, decider use; the status line shows chars kept out. `SIEVE_DECIDER=0` turns the decider off (the rule and size limits still apply, but then nothing in the middle band is cut).
 - There is no `execute` tool any more: it was never called in any test.
@@ -181,6 +181,6 @@ The installed context-mode 1.0.169 (the latest release) did not start cleanly: i
 
 ## Status
 
-Tested in live `claude -p --plugin-dir .` sessions and the benchmarks above. Missing against context-mode: project-boundary path checks and per-project index separation. The compaction resume note is unit-tested but not exercised live.
+Tested in live `claude -p --plugin-dir .` sessions and the benchmarks above. Missing against context-mode: project-boundary path checks. The compaction resume note is unit-tested but not exercised live.
 
 Its MCP server also checks for updates at start by fetching `https://registry.npmjs.org/context-mode/latest` directly (hard-coded, so it ignores `.npmrc` and any proxy). Behind a proxy that shows up as a blocked or unexpected npm request each time a context-mode instance starts. `eval/patch_context_mode_registry.py REGISTRY_URL PLUGIN_DIR` points the check at your registry (it reads `dist-tags.latest` from the package page, since many proxies do not serve `/latest`).

@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { buildSnapshot, chunkText, filterCommand, signature, compactText, isRepetitive, judgeSize, summarize, ftsQuery, headTail, interpreter, isBulkyCommand, isRawFetch, sqlQuote } from './lib'
+import { buildSnapshot, chunkText, filterCommand, signature, compactText, isRepetitive, judgeSize, summarize, ftsQuery, headTail, interpreter, isBulkyCommand, isRawFetch, sqlQuote, summarizeJson, projectKey } from './lib'
 
 test('quotes sql and builds a safe fts query', () => {
   expect(sqlQuote("it's")).toBe("'it''s'")
@@ -164,4 +164,20 @@ test('skipped tests survive the test filter', () => {
   expect(f).toContain("skipped 'needs numpy'")
   expect(f).toContain('Ran 201 tests')
   expect(f).not.toContain('test_150 ')
+})
+
+test('summarises a JSON array of objects with counts and rare rows', () => {
+  const rows = Array.from({ length: 500 }, (_, i) => ({ id: i, status: i === 321 ? 'failed' : 'ok', region: ['eu', 'us'][i % 2] }))
+  const out = summarizeJson(JSON.stringify(rows, null, 2))!
+  expect(out).toContain('500 objects, 3 fields')
+  expect(out).toContain('ok 499, failed 1')
+  expect(out).toContain('"id":321')
+  expect(out.length).toBeLessThan(1500)
+  expect(summarizeJson('not json')).toBeUndefined()
+  expect(summarizeJson(JSON.stringify({ total: 2, items: rows }))).toContain('.items: 500 objects')
+})
+
+test('keys projects without slug collisions', () => {
+  expect(projectKey('/a/b.c')).not.toBe(projectKey('/a/b-c'))
+  expect(projectKey('/Users/x/dev/sieve')).toMatch(/^sieve-[0-9a-f]{8}$/)
 })
