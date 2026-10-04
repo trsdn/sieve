@@ -17,7 +17,7 @@ const CHECKPOINT = 'StrandsAgents/strands-decider-2B-hobson-v19'
 const DECIDER = `http://127.0.0.1:${PORT}/v1/systemone`
 const TOOL = (name: string) => `mcp__sieve__${name}`
 
-const text = (t: string) => ({ result: { content: [{ type: 'text', text: t }] } })
+const text = (t: string) => ({ result: [{ type: 'text', text: t }] })
 
 const TASKS = {
   explore: 'reading or searching code to understand it',
@@ -27,7 +27,7 @@ const TASKS = {
   question: 'a short question that needs an answer, not tool work',
 }
 
-const S = { session: '', db: '', deciderReady: false, kept: 0, indexed: 0, nudged: new Set<string>() }
+const S = { inner: false, session: '', db: '', deciderReady: false, kept: 0, indexed: 0, nudged: new Set<string>() }
 
 async function sql($: any, script: string) {
   const ran = await $.process.run(['sqlite3', S.db], { stdin: script, timeoutMs: 60000 })
@@ -52,6 +52,24 @@ async function snapshot($: any): Promise<string> {
 async function permitted($: any, tool: string, input: Record<string, unknown>): Promise<string | undefined> {
   const { decision } = await $.tool.check({ tool, input })
   return decision === 'allow' ? undefined : `sieve: ${tool} ${decision === 'deny' ? 'is denied by your permission rules' : 'needs your approval; run it through the normal tool'}.`
+}
+
+// Runs a command in the sandbox when the rules allow it outright. When they would ask, the
+// real Bash tool carries the call so the person sees the dialog; the output is still ours.
+async function exec($: any, command: string, argv: string[], timeoutMs: number): Promise<{ output: string; exit: string } | { denied: string }> {
+  const { decision } = await $.tool.check({ tool: 'Bash', input: { command } })
+  if (decision === 'deny') return { denied: 'sieve: denied by your permission rules.' }
+  if (decision === 'allow') {
+    const ran = await $.process.run(argv, { timeoutMs })
+    return { output: `${ran.stdout}${ran.stderr ? `\n[stderr]\n${ran.stderr}` : ''}`.trim(), exit: String(ran.exitCode) }
+  }
+  S.inner = true
+  try {
+    const r = await $.tool.call({ tool: 'Bash', command, timeout: timeoutMs })
+    return r.deny === undefined ? { output: String(r.text ?? '').trim(), exit: r.isError ? 'error' : '0' } : { denied: r.deny }
+  } finally {
+    S.inner = false
+  }
 }
 
 async function index($: any, source: string, content: string): Promise<number> {
@@ -99,14 +117,15 @@ async function ask($: any, state: string, questions: Record<string, unknown>) {
 async function run($: any, language: string, code: string, timeoutMs: number, label: string) {
   const argv = interpreter(language, code)
   if (!argv) return `unsupported language: ${language} (shell, python, javascript)`
-  const ran = await $.process.run(argv, { timeoutMs })
-  const output = `${ran.stdout}${ran.stderr ? `\n[stderr]\n${ran.stderr}` : ''}`.trim()
-  if (output.length <= RESULT_LIMIT) return `${output || '(no output)'}\n[exit ${ran.exitCode}]`
+  const command = argv[0] === '/bin/sh' ? code : `${argv[0]} ${argv[1]} ${JSON.stringify(code)}`
+  const ran = await exec($, command, argv, timeoutMs)
+  if ('denied' in ran) return ran.denied
+  const { output, exit } = ran
+  if (output.length <= RESULT_LIMIT) return `${output || '(no output)'}\n[exit ${exit}]`
   S.kept += output.length - RESULT_LIMIT
   const chunks = await index($, label, output)
-  return `${headTail(output)}\n[exit ${ran.exitCode}] full output indexed as "${label}" (${chunks} chunks); use search to query it.`
+  return `${headTail(output)}\n[exit ${exit}] full output indexed as "${label}" (${chunks} chunks); use search to query it.`
 }
-
 
 export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
@@ -213,8 +232,6 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'mcp__sieve__execute' }, async ($, e: any) => {
-    const denied = await permitted($, 'Bash', { command: e.language === 'shell' || e.language === 'sh' || e.language === 'bash' ? e.code : `${e.language === 'python' ? 'python3' : 'node'} -c ${JSON.stringify(e.code)}` })
-    if (denied) return text(denied)
     const label = `execute:${e.language}:${(await $.clock.now()).toString(36)}`
     let out = await run($, e.language, e.code, e.timeout_ms ?? 30000, label)
     if (e.intent && out.includes('full output indexed')) out += `\n\n${await search($, [e.intent])}`
@@ -224,15 +241,13 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__sieve__batch' }, async ($, e: any) => {
     const parts: string[] = []
     for (const c of e.commands as { label: string; command: string }[]) {
-      const denied = await permitted($, 'Bash', { command: c.command })
-      if (denied) {
-        parts.push(`${c.label}: ${denied}`)
+      const ran = await exec($, c.command, ['/bin/sh', '-c', c.command], 60000)
+      if ('denied' in ran) {
+        parts.push(`${c.label}: ${ran.denied}`)
         continue
       }
-      const ran = await $.process.run(['/bin/sh', '-c', c.command], { timeoutMs: 60000 })
-      const output = `${ran.stdout}${ran.stderr}`.trim()
-      S.kept += output.length
-      parts.push(`${c.label}: ${(await index($, c.label, output)) } chunks, ${output.length} chars, exit ${ran.exitCode}`)
+      S.kept += ran.output.length
+      parts.push(`${c.label}: ${await index($, c.label, ran.output)} chunks, ${ran.output.length} chars, exit ${ran.exit}`)
     }
     return text(`${parts.join('\n')}\n\n${await search($, e.queries)}`)
   })
@@ -242,7 +257,7 @@ export const register: Register = (on, options) => {
       const denied = await permitted($, 'Read', { file_path: e.path })
       if (denied) return text(denied)
     }
-    const content = e.content ?? (e.path ? (await $.fs.read(e.path)).text ?? '' : '')
+    const content = e.content ?? (e.path ? await $.fs.read(e.path) : '')
     const n = await index($, e.source, String(content))
     S.kept += String(content).length
     return text(`indexed ${n} chunks as "${e.source}"`)
@@ -260,6 +275,7 @@ export const register: Register = (on, options) => {
   )
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    if (S.inner) return next(e)
     const command: string = e.command
     if (isRawFetch(command))
       return { deny: `sieve: use ${TOOL('fetch')} for URLs, or send the output to a file or through head/jq.` }

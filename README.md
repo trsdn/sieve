@@ -37,4 +37,10 @@ Pure logic lives in `hooks/lib.ts` with tests in `hooks/lib.test.ts`. Everything
 
 ## Status
 
-Validated and unit-tested; not yet run in a live session. Unverified: the result shape of registered tools (`{ content: [{ type: 'text', text }] }`) and the background start of the decider server. Missing against context-mode: project-boundary path checks, per-project index separation.
+Tested in live `claude -p --plugin-dir .` sessions: `execute` (shell, python), `index`, `search`, `fetch` and `batch` work; the routing hooks (one-time nudge for bulky Bash, `curl`/`WebFetch` refusal) work; the mod starts and stops its own decider server (ready in about 9 s).
+
+Known limits:
+- The decider is conservative. On a handful of probes `find /` scored only 0.25 for "bulky" and most prompts classified below 0.8, so at the current thresholds the fixed rules do almost all of the routing. The thresholds are not tuned.
+- `execute` returns head and tail up to 6000 chars, which saves little on small outputs.
+- When a command needs approval, `execute` hands it to the real Bash tool; that path (the dialog) was not exercised headlessly.
+- Missing against context-mode: project-boundary path checks, per-project index separation, compaction resume not exercised live.
