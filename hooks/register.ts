@@ -4,9 +4,11 @@ import {
   buildSnapshot,
   chunkText,
   compactText,
+  filterCommand,
   ftsQuery,
   isRepetitive,
   judgeSize,
+  signature,
   sqlQuote,
   summarize,
 } from './lib'
@@ -18,18 +20,25 @@ const DECIDER = `http://127.0.0.1:${PORT}/v1/systemone`
 const LOOKUP_AT = 0.5
 const SEARCH = 'mcp__sieve__search'
 const KEEP_DAYS = 14
+// The one thing context-mode's start-up text gets right, in a few words: plan commands so only
+// the answer comes back. Fixed text in the system prompt, so it is cached after the first request.
+const GUIDE = 'Tool output stays in every later request, so ask commands for the answer, not the data. For test runs, builds and long logs, write the output to a file and print only what you need, for example: cmd > /tmp/out.log 2>&1; echo exit=$?; tail -n 15 /tmp/out.log; grep -E "FAIL|ERROR|skipped" /tmp/out.log. This matters most when a command fails: Claude Code then cuts the middle of its output, where the failures usually are. Long results may come back summarised by sieve with the path of the full output: query that file instead of running the command again.'
+// Command filters apply from this size on; a type of call cut wrongly this often is never cut again.
+const FILTER_MIN = 2000
+const WRONG_LIMIT = 2
 
 const text = (t: string) => ({ result: [{ type: 'text', text: t }] })
 
 const S = {
   checkedAt: 0,
   useDecider: true,
+  guide: true,
   session: '',
   db: '',
   deciderReady: false,
   dir: '',
   out: '',
-  cuts: [] as { what: string; left: number }[],
+  cuts: [] as { what: string; sig: string; left: number }[],
   recut: 0,
   restored: 0,
   prompt: '',
@@ -137,7 +146,8 @@ function textOf(e: any, r: any): string | undefined {
     return blocks && blocks.length && blocks.every(b => b?.type === 'text' && typeof b.text === 'string') ? blocks.map(b => b.text).join('\n\n') : undefined
   }
   switch (e.tool) {
-    case 'Bash': return r.stdout
+    // A command that failed comes back as one string, already cut in the middle by the harness.
+    case 'Bash': return typeof r === 'string' ? r : r.stdout
     case 'Grep': return r.content
     case 'WebFetch': return r.result
     case 'Read': return r.file?.content
@@ -149,7 +159,7 @@ function textOf(e: any, r: any): string | undefined {
 function withText(e: any, r: any, t: string): any {
   if (e.tool.startsWith('mcp__')) return Array.isArray(r) ? [{ type: 'text', text: t }] : { ...r, content: [{ type: 'text', text: t }] }
   switch (e.tool) {
-    case 'Bash': return { ...r, stdout: t, persistedOutputPath: undefined, persistedOutputSize: undefined }
+    case 'Bash': return typeof r === 'string' ? { stdout: t, stderr: '', interrupted: false } : { ...r, stdout: t, persistedOutputPath: undefined, persistedOutputSize: undefined }
     case 'Grep': return { ...r, content: t }
     case 'WebFetch': return { ...r, result: t }
     case 'Read': return { ...r, file: { ...r.file, content: t } }
@@ -161,6 +171,22 @@ function withText(e: any, r: any, t: string): any {
 function describe(e: any): string {
   const { tool, tool_use_id, consent, ...input } = e
   return String(e.command ?? e.pattern ?? e.url ?? e.file_path ?? `${tool} ${JSON.stringify(input).slice(0, 160)}`)
+}
+
+// What a learned rule is keyed on: the command's tool and subcommand, or the tool.
+function sigOf(e: any): string {
+  return e.tool === 'Bash' ? `Bash:${signature(String(e.command))}` : e.tool
+}
+
+async function wrongCuts($: any, sig: string): Promise<number> {
+  const all = ((await $.store.get('wrongCuts')) ?? {}) as Record<string, number>
+  return all[sig] ?? 0
+}
+
+async function learnWrongCut($: any, sig: string) {
+  const all = ((await $.store.get('wrongCuts')) ?? {}) as Record<string, number>
+  all[sig] = (all[sig] ?? 0) + 1
+  await $.store.set('wrongCuts', all)
 }
 
 // The decider's one job on a result: does the request need every line of it? The rule has
@@ -193,18 +219,19 @@ async function logUsage($: any, line: Record<string, unknown>) {
   }
 }
 
-// A cut followed within two calls by the same call again was a wrong cut: the repeat gets the whole output.
-function watchRepeat(e: any): boolean {
+// A cut followed within two calls by the same call again was a wrong cut: the repeat gets the
+// whole output, and the type of call is remembered across sessions.
+function watchRepeat(e: any): string | undefined {
   const what = describe(e)
-  let repeat = false
+  let hit: string | undefined
   for (const c of S.cuts) {
     if (c.left <= 0) continue
-    if (c.what === what) repeat = true
+    if (c.what === what) hit = c.sig
     c.left -= 1
   }
-  S.cuts = S.cuts.filter(c => c.left > 0 && !(repeat && c.what === what))
-  if (repeat) S.recut += 1
-  return repeat
+  S.cuts = S.cuts.filter(c => c.left > 0 && c.what !== what)
+  if (hit) S.recut += 1
+  return hit
 }
 
 // Cuts a large result in place: the model gets a summary of its structure, the whole output
@@ -214,9 +241,12 @@ async function compact($: any, e: any, ran: any): Promise<any | undefined> {
   const key = limitKey(e)
   if (ran.deny !== undefined || !r || !LIMITS[key]) return undefined
   let full = textOf(e, r)
-  if (typeof full !== 'string') return undefined
+  if (typeof full !== 'string') {
+    await logUsage($, { tool: e.tool, unreadable: typeof r, keys: r && typeof r === 'object' ? Object.keys(r).slice(0, 12) : [], isError: ran.isError === true, textLen: String(ran.text ?? '').length })
+    return undefined
+  }
   // Bash keeps a long output in a file and hands back a preview: use the file, not the preview.
-  let path: string | undefined = r.persistedOutputPath
+  let path: string | undefined = typeof r === 'object' ? r.persistedOutputPath : undefined
   if (path) {
     try {
       full = await $.fs.read(path)
@@ -224,12 +254,19 @@ async function compact($: any, e: any, ran: any): Promise<any | undefined> {
       // over 4 MiB or gone: the preview is what there is
     }
   }
+  const sig = sigOf(e)
+  if ((await wrongCuts($, sig)) >= WRONG_LIMIT) {
+    await logUsage($, { tool: key === 'mcp' ? 'mcp' : e.tool, size: full.length, verdict: 'learned-keep' })
+    return undefined
+  }
+  // A known command gets its own filter: failures, totals and warnings stay, the rest is noise.
+  const filtered = e.tool === 'Bash' && full.length > FILTER_MIN ? filterCommand(String(e.command), full) : undefined
   const size = e.tool === 'Glob' ? r.filenames.length : full.length
-  const verdict = judgeSize(key, size, ran.isError === true, 1)
+  const verdict = filtered ? 'filter' : judgeSize(key, size, ran.isError === true, 1)
   const repetitive = e.tool === 'Glob' || isRepetitive(full)
-  let cut = verdict === 'compact'
+  let cut = verdict === 'compact' || verdict === 'filter'
   if (verdict === 'ask' && repetitive) cut = !(await needsEveryLine($, e, full))
-  await logUsage($, { tool: key === 'mcp' ? 'mcp' : e.tool, size, verdict, repetitive, cut })
+  await logUsage($, { tool: key === 'mcp' ? 'mcp' : e.tool, sig, size, verdict, repetitive, cut })
   if (!cut) return undefined
 
   const source = `${e.tool}:${(await $.clock.now()).toString(36)}${++S.seen}`.replace(/[^\w.:-]/g, '_')
@@ -238,10 +275,10 @@ async function compact($: any, e: any, ran: any): Promise<any | undefined> {
     await $.fs.write(path, full)
   }
   const foot = `[sieve: ${full.length} chars summarised. Full output: ${path}. For exact counts or lookups run grep/wc/awk on that file; ${SEARCH} finds passages. Repeat the same call to get everything.]`
-  const short = repetitive ? `${summarize(e.tool, full)}\n${foot}` : `${compactText(full, { head: 1800, tail: 1200, signal: 15 })}\n${foot}`
+  const short = filtered ? `${filtered}\n${foot}` : repetitive ? `${summarize(e.tool, full)}\n${foot}` : `${compactText(full, { head: 1800, tail: 1200, signal: 15 })}\n${foot}`
   await index($, source, full)
   await record($, 'cut', `${source} ${describe(e)}`)
-  S.cuts.push({ what: describe(e), left: 2 })
+  S.cuts.push({ what: describe(e), sig, left: 2 })
   S.kept += full.length - short.length
   S.compacted += 1
   $.ui.status(`sieve: ${Math.round(S.kept / 1000)}k chars kept out`)
@@ -252,6 +289,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const home = (await $.env.get('HOME')) ?? ''
     S.useDecider = (await $.env.get('SIEVE_DECIDER')) !== '0'
+    S.guide = (await $.env.get('SIEVE_GUIDE')) !== '0'
     const slug = e.cwd.replace(/[/.]/g, '-')
     S.dir = `${home}/.claude/sieve`
     S.db = `${S.dir}/${slug}.db`
@@ -307,11 +345,14 @@ delete from events where ts < ${cutoff};`,
       else if (e.tool === 'Bash' && ran.deny === undefined) await record($, ran.isError ? 'error' : 'command', e.command)
       if (repeat) {
         S.restored += 1
-        await logUsage($, { tool: e.tool, restored: true })
+        await learnWrongCut($, repeat)
+        await logUsage($, { tool: e.tool, sig: repeat, restored: true })
         return ran
       }
       return (await compact($, e, ran)) ?? ran
-    } catch {
+    } catch (err) {
+      // never break a tool call; but say why nothing was cut
+      await logUsage($, { tool: e.tool, error: String(err).slice(0, 300) })
       return ran
     }
   })
@@ -334,7 +375,9 @@ delete from events where ts < ${cutoff};`,
     try {
       const raw = await sql($, `.mode json\nselect snapshot from resume where session = ${sqlQuote(S.session)};`)
       const note = raw.trim() ? JSON.parse(raw)[0]?.snapshot : ''
-      if (note) return { sections: [...composed.sections, { id: 'sieve:resume', text: `Before the last compaction, this session had:\n${note}`, scope: 'session' as const }] }
+      const guide = S.guide ? [{ id: 'sieve:guide', text: GUIDE, scope: 'session' as const }] : []
+      const resume = note ? [{ id: 'sieve:resume', text: `Before the last compaction, this session had:\n${note}`, scope: 'session' as const }] : []
+      return { sections: [...composed.sections, ...guide, ...resume] }
     } catch {
       // no note, no section
     }

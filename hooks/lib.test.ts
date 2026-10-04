@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { buildSnapshot, chunkText, compactText, isRepetitive, judgeSize, summarize, ftsQuery, headTail, interpreter, isBulkyCommand, isRawFetch, sqlQuote } from './lib'
+import { buildSnapshot, chunkText, filterCommand, signature, compactText, isRepetitive, judgeSize, summarize, ftsQuery, headTail, interpreter, isBulkyCommand, isRawFetch, sqlQuote } from './lib'
 
 test('quotes sql and builds a safe fts query', () => {
   expect(sqlQuote("it's")).toBe("'it''s'")
@@ -110,4 +110,58 @@ test('mcp results and playwright snapshots have their own limits', () => {
   expect(judgeSize('mcp', 2000000, false)).toBe('compact')
   expect(judgeSize('ReadSnapshot', 12000, false)).toBe('ask')
   expect(judgeSize('Read', 12000, false)).toBe('pass')
+})
+
+test('signature keys a command on tool and subcommand', () => {
+  expect(signature('cd repo && git log --stat -n 5')).toBe('git log')
+  expect(signature('python3 -m pytest -q tests/')).toBe('python -m pytest')
+  expect(signature('npm install --silent')).toBe('npm install')
+  expect(signature('ls -la')).toBe('ls')
+})
+
+test('test output keeps failures and totals, drops passes', () => {
+  const out = [...Array.from({ length: 300 }, (_, i) => `PASS tests/t_${i}.py::case_${i}`), 'FAIL tests/billing.py::refund', 'AssertionError: expected 10.05 got 10.04', '', '300 passed, 1 failed in 3.2s'].join('\n')
+  const f = filterCommand('python -m pytest', out)!
+  expect(f).toContain('AssertionError: expected 10.05 got 10.04')
+  expect(f).toContain('300 passed, 1 failed')
+  expect(f).not.toContain('t_150')
+  expect(f.length).toBeLessThan(out.length / 5)
+})
+
+test('git log becomes one line per commit, patches are left alone', () => {
+  const log = Array.from({ length: 50 }, (_, i) => `commit ${'a'.repeat(39)}${i % 10}\nAuthor: Mira Okafor <m@x.io>\nDate:   Sun Oct 4 10:00:00 2026 +0200\n\n    change number ${i}\n`).join('\n')
+  const f = filterCommand('git log', log)!
+  expect(f).toContain('50 commits')
+  expect(f).toContain('Mira Okafor: change number 7')
+  expect(filterCommand('git log -p', `${log}\ndiff --git a/x b/x\n+code`)).toBeUndefined()
+})
+
+test('installs keep warnings and the summary', () => {
+  const log = [...Array.from({ length: 200 }, (_, i) => `Downloading package_${i}-1.0.tar.gz (12 kB)`), 'WARNING: package_7 is deprecated', 'Successfully installed 200 packages'].join('\n')
+  const f = filterCommand('pip install -r requirements.txt', log)!
+  expect(f).toContain('WARNING: package_7 is deprecated')
+  expect(f).toContain('Successfully installed 200 packages')
+  expect(f).not.toContain('package_100-1.0')
+  expect(filterCommand('ls -la', log)).toBeUndefined()
+})
+
+test('an unnamed test script is recognised by its output', () => {
+  const out = [...Array.from({ length: 100 }, (_, i) => `PASS tests/t_${i}.py`), 'FAIL tests/x.py::y', 'AssertionError: boom'].join('\n')
+  expect(filterCommand('sh run_tests.sh', out)).toContain('AssertionError: boom')
+  expect(filterCommand('sh run_tests.sh', Array.from({ length: 100 }, (_, i) => `line ${i}`).join('\n'))).toBeUndefined()
+})
+
+test('a failure header does not drag passing lines along', () => {
+  const out = ['Error: Exit code 1', ...Array.from({ length: 200 }, (_, i) => `PASS tests/t_${i}.py`), 'done'].join('\n')
+  const f = filterCommand('sh run_tests.sh', out)!
+  expect(f).toContain('Error: Exit code 1')
+  expect(f).not.toContain('t_3.py')
+})
+
+test('skipped tests survive the test filter', () => {
+  const out = [...Array.from({ length: 200 }, (_, i) => `test_${i} (tests.test_more.Case.test_${i}) ... ok`), "test_x (tests.test_more.Case.test_x) ... skipped 'needs numpy'", 'Ran 201 tests in 1.0s', 'OK (skipped=1)'].join('\n')
+  const f = filterCommand('python3 -m unittest discover -s tests -v', out)!
+  expect(f).toContain("skipped 'needs numpy'")
+  expect(f).toContain('Ran 201 tests')
+  expect(f).not.toContain('test_150 ')
 })

@@ -264,3 +264,96 @@ export const summarize = (tool: string, text: string): string => {
   const kind = kindOf(tool, text)
   return kind === 'listing' ? treeSummary(text) : kind === 'grep' ? grepSummary(text) : linesSummary(text)
 }
+
+// ---- command-specific filters (the RTK idea, inside the mod) --------------------------------
+
+// "cd x && git log --stat -n 5" -> "git log": what a learned rule or a filter is keyed on.
+export const signature = (command: string): string => {
+  const last = command.split(/&&|;|\|\|/).map(s => s.trim()).filter(Boolean).filter(s => !/^cd\s/.test(s))[0] ?? ''
+  const words = last.replace(/^(sudo|time|env(\s+\w+=\S+)+)\s+/, '').split(/\s+/)
+  const tool = (words[0] ?? '').split('/').pop() ?? ''
+  const sub = words.slice(1).find(w => !w.startsWith('-')) ?? ''
+  const withSub = ['git', 'npm', 'pnpm', 'yarn', 'uv', 'pip', 'pip3', 'cargo', 'go', 'docker', 'kubectl', 'poetry', 'bun']
+  if (/^python3?$/.test(tool) && words[1] === '-m') return `python -m ${words[2] ?? ''}`
+  return withSub.includes(tool) && sub ? `${tool} ${sub}` : tool
+}
+
+const TEST_CMD = /^(pytest|py\.test|python -m (pytest|unittest)|jest|vitest|mocha|cargo test|go test|npm test|pnpm test|yarn test|bun test|npm run|pnpm run|yarn run|mvn|gradle|rspec|phpunit|tox|nox|make)$/
+const PASS_LINE = /^\s*(PASS\b|✓|✔|ok\b|\.+$|test \S+ \.\.\. ok$|\S+\s+\.\.\.\s+ok$|.*\bPASSED\b|=== RUN\b|--- PASS\b)/
+const FAIL_LINE = /\b(FAIL(ED)?|ERROR|Error|Exception|Traceback|panic|AssertionError|assert|✗|✕|×)\b|^\s*E\s{2,}/
+const SKIP_LINE = /\b(skip(ped)?|xfail|xpass|expected failure|warn(ing)?|deprecat\w*)\b/i
+const SUMMARY_LINE = /\b(\d+ (passed|failed|errors?|skipped|tests?|suites?)|Ran \d+ tests?|^OK\b|^FAILED\b|Tests?:|Test Suites:|test result:|Summary)\b/i
+
+// Passing tests and progress dots go; failures keep their block, totals stay.
+export const filterTests = (text: string): string => {
+  const lines = text.split('\n')
+  const keep: string[] = []
+  let dropped = 0
+  let block = 0
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i]!
+    const passing = PASS_LINE.test(l) && !FAIL_LINE.test(l)
+    if (FAIL_LINE.test(l) && !PASS_LINE.test(l)) block = 25
+    // a passing line never belongs to a failure block, wherever it stands
+    if (passing && !SUMMARY_LINE.test(l) && i < lines.length - 6) {
+      dropped++
+      continue
+    }
+    if (block > 0 || SUMMARY_LINE.test(l) || SKIP_LINE.test(l) || i >= lines.length - 6) {
+      keep.push(l)
+      block = l.trim() === '' && block < 20 ? 0 : block - 1
+    } else if (PASS_LINE.test(l) || l.trim() === '') dropped++
+    else if (i < 4) keep.push(l)
+    else dropped++
+  }
+  return `${keep.join('\n')}\n[sieve: ${dropped} passing or progress lines left out]`
+}
+
+// One line per commit: hash, date, author, subject (and the stat line, if any).
+export const filterGitLog = (text: string): string | undefined => {
+  if (/^diff --git /m.test(text)) return undefined // a patch is code: never on size alone
+  const out: string[] = []
+  let cur: { h: string; a: string; d: string; s: string; st: string } | undefined
+  const flush = () => cur && out.push(`${cur.h.slice(0, 9)} ${cur.d} ${cur.a}: ${cur.s}${cur.st ? `  (${cur.st})` : ''}`)
+  for (const l of text.split('\n')) {
+    const c = /^commit ([0-9a-f]{7,40})/.exec(l)
+    if (c) { flush(); cur = { h: c[1]!, a: '', d: '', s: '', st: '' }; continue }
+    if (!cur) continue
+    const a = /^Author:\s+(.*?)\s*<.*>$/.exec(l) ?? /^Author:\s+(.*)$/.exec(l)
+    if (a) cur.a = a[1]!.trim()
+    else if (/^Date:\s+/.test(l)) cur.d = l.replace(/^Date:\s+/, '').trim().split(' ').slice(1, 5).join(' ')
+    else if (!cur.s && /^\s{4}\S/.test(l)) cur.s = l.trim()
+    else if (/\d+ files? changed/.test(l)) cur.st = l.trim()
+  }
+  flush()
+  return out.length ? `${out.length} commits\n${out.join('\n')}` : undefined
+}
+
+// Installs and builds: warnings, errors and the closing summary; downloads and progress go.
+export const filterNoise = (text: string): string => {
+  const lines = text.split('\n')
+  const keep = new Set<number>()
+  lines.forEach((l, i) => {
+    if (/\b(warn(ing)?|error|ERR!|fail(ed)?|denied|not found|conflict|deprecated|vulnerab|added \d+|removed \d+|changed \d+|up to date|Successfully|Installed \d+|Resolved \d+|Finished|Compiled|built in|Done in)\b/i.test(l)) {
+      for (let k = Math.max(0, i - 1); k <= Math.min(lines.length - 1, i + 2); k++) keep.add(k)
+    }
+    if (i < 3 || i >= lines.length - 8) keep.add(i)
+  })
+  const kept = [...keep].sort((a, b) => a - b).map(i => lines[i]!)
+  return `${kept.join('\n')}\n[sieve: ${lines.length - kept.length} progress lines left out]`
+}
+
+// The filter for a command, if one is known and it actually shrinks the output.
+export const filterCommand = (command: string, text: string): string | undefined => {
+  const sig = signature(command)
+  let out: string | undefined
+  if (sig === 'git log') out = filterGitLog(text)
+  else if (TEST_CMD.test(sig) && (sig !== 'make' && sig !== 'npm run' && sig !== 'pnpm run' && sig !== 'yarn run' || /\b(test|spec|check)\b/.test(command))) out = filterTests(text)
+  else if (/^(npm|pnpm|yarn|bun) (install|i|add|ci|update)$|^(pip|pip3|uv|poetry) (install|add|sync|lock|update)$|^python -m pip$|^(make|tsc|webpack|vite|cargo build|go build|gradle|mvn|docker build)$/.test(sig) || /^(npm|pnpm|yarn) run$/.test(sig) && /\bbuild\b/.test(command)) out = filterNoise(text)
+  // An unknown command whose output reads like a test run (many passing lines) gets the test filter.
+  if (!out) {
+    const lines = text.split('\n').filter(l => l.trim())
+    if (lines.length >= 30 && lines.filter(l => PASS_LINE.test(l)).length / lines.length >= 0.5) out = filterTests(text)
+  }
+  return out && out.length < text.length * 0.7 ? out : undefined
+}

@@ -37,6 +37,8 @@ Pure logic lives in `hooks/lib.ts` with tests in `hooks/lib.test.ts`. Everything
 
 ## How it works
 
+A short fixed guide in the system prompt (about 110 tokens, cached after the first request) asks the model to plan commands so only the answer comes back, with one concrete pattern: write test, build and log output to a file and print the summary and failures. This is the part of context-mode's start-up text that changes behaviour, without its 5,000 characters and its note on every tool call. `SIEVE_GUIDE=0` turns it off.
+
 Results of Bash, Grep, Glob, WebFetch, any MCP tool that returns text, and Playwright snapshot files read back with `Read` are rewritten in place after they ran. Nothing is refused and the model has nothing to learn; the only tool is `mcp__sieve__search`.
 
 - Up to 4000 chars (Glob: 150 paths) a result is left alone. Other `Read`s are only cut above 80000 chars: code must stay whole.
@@ -44,6 +46,9 @@ Results of Bash, Grep, Glob, WebFetch, any MCP tool that returns text, and Playw
   1. **A rule** (`isRepetitive`, no model): many lines of few shapes (digits and words blanked), such as a listing, a log, progress output or a table dump. Code, config and prose never pass.
   2. **The decider** reads the request next to the output and answers one question: is it a *lookup or count* (how many, which, list all, find, exact) or an *overview* (what is this, does it look ok)? Cut only on overview. Anything at 0.5 or above for lookup keeps the output whole; no answer keeps it whole.
 - Above 30000 chars Bash and Grep results are cut without asking (the harness caps them anyway). MCP results and snapshot reads are never cut blind, up to 1 MB: a blind cut gave wrong answers in the browser test.
+- **Known commands get their own filter** (the RTK idea, inside the mod): test runners keep failures with their block, skips, warnings and totals and drop passing lines; `git log` becomes one line per commit (a patch is never filtered); installs and builds keep warnings, errors and the closing summary. Unnamed test scripts are recognised by their output. Applied from 2000 chars, without the decider.
+- A command that fails comes back from Claude Code as text already cut in the middle (about 10,000 chars), where failures usually are; sieve cannot recover that part, it can only filter what is left. The guide exists to avoid this case.
+- **Learned keep**: a call that is repeated right after a cut counts as a wrong cut for its type (`git log`, `python -m pytest`, a tool name); after two, that type is never cut again, across sessions (`$.store`).
 - A cut result becomes a **summary of its structure**: a directory tree with counts by extension and folder, a per-file match table for Grep, or a table of line shapes with the rare and failure lines kept verbatim. The footer names the file with the whole output, so the model can `grep`/`wc` it; the output is also indexed (`mcp__sieve__search`, BM25).
 - **A repeated call** within two calls of a cut gets the whole output: the repeat is the signal that the cut was wrong.
 - The full output is written to `~/.claude/projects/<project>/<session>/tool-results/sieve-*.txt`, the harness's own folder, because the model can read it there with narrow permissions (tested with `Bash(grep:*)` only: 3.5 MB of Grep output became 3 KB and the model counted 39,946 matches in the file).
@@ -78,6 +83,25 @@ Over four prompt sets the chosen setting kept all 125 requests that need the who
 - context-mode, 5-task check after repairing its install (1 run per cell, so no more than a sanity check): all correct, about 6.4k tokens more per session than no plugin (tool descriptions), same turns.
 - Single runs vary a lot (`tests` took 3 to 7 turns for the same setup because the model explores differently), so differences under about 10% are noise. Cost is noisy too (prompt-cache hits); tokens and turns are steadier.
 - Not measured: interactive sessions (approval dialogs), sessions long enough to compact, other models, the approval path of `execute`, wrong cuts in real use (`/sieve` counts them).
+
+### Real repository session (`eval/repobench.py`, `eval/repo_report.py`)
+
+The closest to normal work: a copy of [more-itertools](https://github.com/more-itertools/more-itertools) (933 tests, 2,503 commits) with one injected bug, and a five-step session: run the tests verbosely and count skipped and failed, find and fix the bug (judged by running the suite afterwards, tests untouched), find the most-changed file in the last 200 commits, count the public functions in a 175 KB module, recall the bug. Each run gets its own copy. "Window-turns" sums the context size over every model call: what the window costs over the session.
+
+| Run | Setup | Right | Window-turns | Uncached input | Cost |
+| --- | --- | --- | --- | --- | --- |
+| first, 4 setups at once | no plugin | 15/15 | 254,883 | 11,340 | $0.200 |
+| | context-mode | 15/15 | 275,059 | 21,995 | $0.288 |
+| | sieve without the guide | 15/15 | 258,501 | 11,872 | $0.211 |
+| side by side, final code | no plugin | 15/15 | 259,318 | 5,319 | $0.163 |
+| | **sieve with the guide** | 15/15 | **207,173 (-20%)** | **4,125 (-22%)** | **$0.130 (-20%)** |
+| side by side, ablation | sieve | 15/15 | 229,347 | 4,255 | $0.135 |
+| | sieve, decider off | 15/15 | 256,474 | 5,096 | $0.161 |
+
+- context-mode won the first step (verbose test run: 2 calls and 43k window-turns against 4 calls and 78k) because its start-up text makes the model write the output to a file and grep it; it lost the other steps to its overhead. The guide copies that behaviour: step 1 alone, 5 runs each, 37k against 78k window-turns, all right.
+- Without the guide sieve equals no plugin here: in a normal session the outputs that would be cut are rare.
+- **The decider's share is not shown by this session.** In the ablation it made one decision in 25 minutes and kept that output whole; the 11% between the two lines is run-to-run variance. With the guide the model asks for small outputs, so the middle band where the decider works stays almost empty. Its value is in the cases measured further down (overview questions over large output), not in this one.
+- Costs move with prompt-cache state (compare the two no-plugin rows), so only rows run side by side are compared. 3 sessions per row.
 
 ### Long session (`eval/longbench.py`, `eval/long_report.py`)
 

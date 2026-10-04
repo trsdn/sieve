@@ -21,3 +21,6 @@ Claude Code mod (function hooks, not command hooks). Replaces `context-mode`; se
 - A repeated call within two calls of a cut gets the whole output (the repeat is the signal that the cut was wrong).
 - The full output goes to `~/.claude/projects/<slug>/<session>/tool-results/sieve-*.txt`, the harness's own folder, because the model can read there with narrow permissions (tested with `Bash(grep:*)` only). Do not move it to a folder outside the project's allowed paths without repeating that test.
 - The index is one SQLite file per project (`~/.claude/sieve/<slug>.db`); rows and files older than 14 days are deleted at session start.
+- The guide (`GUIDE` in register.ts) carries most of the measured gain in a normal session; any change to it needs the repo benchmark (`eval/repobench.py`) run side by side with no plugin. Keep it fixed text: it sits in the cached part of the prompt.
+- A failed Bash result arrives as a string; a hook must answer with the Bash object shape (`{ stdout, stderr, interrupted }`).
+- Benchmark copies live in `~/dev/sieve-bench-runs`, not under a hidden folder: Claude Code asks before editing files in hidden folders, which a headless run treats as a refusal.
