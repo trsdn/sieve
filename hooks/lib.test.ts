@@ -175,6 +175,10 @@ test('summarises a JSON array of objects with counts and rare rows', () => {
   expect(out.length).toBeLessThan(1500)
   expect(summarizeJson('not json')).toBeUndefined()
   expect(summarizeJson(JSON.stringify({ total: 2, items: rows }))).toContain('.items: 500 objects')
+  // 3 failed among 20 pending: every failed row is shown
+  const mixed = Array.from({ length: 1000 }, (_, i) => ({ id: i, status: [7, 500, 900].includes(i) ? 'failed' : i % 50 === 0 ? 'pending' : 'ok' }))
+  const m = summarizeJson(JSON.stringify(mixed))!
+  for (const id of [7, 500, 900]) expect(m).toContain(`"id":${id},"status":"failed"`)
 })
 
 test('keys projects without slug collisions', () => {

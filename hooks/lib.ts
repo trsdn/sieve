@@ -396,7 +396,7 @@ const describeRows = (rows: Record<string, unknown>[], label: string): string =>
   }
   const lines = [`${label}: ${rows.length} objects, ${fields.size} fields`]
   // A field's rare values mark the rows worth showing (status "failed" among thousands of "ok").
-  const rare: [string, string][] = []
+  const rare: [string, string, number][] = []
   for (const [k, f] of [...fields.entries()].slice(0, 40)) {
     const presence = f.n < rows.length ? `, in ${f.n}` : ''
     const range = f.min <= f.max ? `, ${f.min}..${f.max}` : ''
@@ -404,12 +404,17 @@ const describeRows = (rows: Record<string, unknown>[], label: string): string =>
     if (f.values.size >= 2 && f.values.size <= 12) {
       const counts = top(f.values, 12)
       lines.push(`    ${counts.map(([v, n]) => `${v} ${n}`).join(', ')}`)
-      for (const [v, n] of counts) if (n <= Math.max(1, rows.length * 0.05)) rare.push([k, v])
+      for (const [v, n] of counts) if (n <= Math.max(1, rows.length * 0.05)) rare.push([k, v, n])
     }
   }
   lines.push('first rows:', ...rows.slice(0, 3).map(r => `  ${show(r)}`))
-  const odd = rows.filter((r, i) => i >= 3 && rare.some(([k, v]) => String(r[k]).slice(0, 60) === v)).slice(0, 5)
-  if (odd.length) lines.push('rows with rare values:', ...odd.map(r => `  ${show(r)}`))
+  // Rarest values first, every one of them shown at least once: 3 "failed" must not lose to 40 "pending".
+  const odd = new Set<Record<string, unknown>>()
+  for (const [k, v] of rare.sort((a, b) => a[2] - b[2])) {
+    const hits = rows.filter((r, i) => i >= 3 && String(r[k]).slice(0, 60) === v)
+    for (const r of hits.slice(0, hits.length <= 5 ? 5 : 2)) if (odd.size < 12) odd.add(r)
+  }
+  if (odd.size) lines.push('rows with rare values:', ...[...odd].map(r => `  ${show(r)}`))
   return lines.join('\n')
 }
 
