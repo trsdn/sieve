@@ -3,3 +3,4 @@ node_modules/
 *.log
 tsconfig.json
 .claude-plugin/types/
+.scratch/

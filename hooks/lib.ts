@@ -3,8 +3,8 @@ export const AUTO_INDEX_LIMIT = 12000
 
 export const sqlQuote = (s: string): string => `'${s.replaceAll("'", "''")}'`
 
-export const ftsQuery = (q: string): string =>
-  (q.match(/[\p{L}\p{N}_]{2,}/gu) ?? []).map(t => `"${t}"`).join(' OR ')
+export const ftsQuery = (q: string, join: 'AND' | 'OR' = 'OR'): string =>
+  (q.match(/[\p{L}\p{N}_]{2,}/gu) ?? []).map(t => `"${t}"`).join(` ${join} `)
 
 export type Chunk = { title: string; body: string }
 
@@ -85,4 +85,50 @@ export const buildSnapshot = (events: SessionEvent[], compactCount: number, max 
     out = lines.join('\n')
   }
   return out
+}
+
+// Lines in a cut-out middle that must survive: failures are what the model reads logs for.
+const SIGNAL = /\b(error|fail(ed|ure|ing)?|fatal|panic|exception|traceback|warn(ing)?|denied|refused|timeout|not found|cannot|unable)\b/i
+
+export type CompactOptions = { head: number; tail: number; signal: number }
+
+export const compactText = (text: string, { head, tail, signal }: CompactOptions): string => {
+  if (text.length <= head + tail) return text
+  const lines = text.split('\n')
+  let start = 0
+  let used = 0
+  while (start < lines.length && used + lines[start]!.length < head) used += lines[start++]!.length + 1
+  let end = lines.length
+  used = 0
+  while (end > start && used + lines[end - 1]!.length < tail) {
+    end -= 1
+    used += lines[end]!.length + 1
+  }
+  const middle = lines.slice(start, end)
+  const hits = middle.filter(l => SIGNAL.test(l)).slice(0, signal).map(l => l.slice(0, 200))
+  const note = `… [${middle.length} lines / ${middle.join('\n').length} chars omitted${hits.length ? `; ${hits.length} signal line(s) kept below` : ''}] …`
+  return [...lines.slice(0, start), note, ...hits, ...(hits.length ? ['…'] : []), ...lines.slice(end)].join('\n')
+}
+
+// Characters a result may carry before it is cut (`soft`), and above which it is cut without
+// asking the decider (`hard`). Glob counts paths, not characters.
+export const LIMITS: Record<string, { soft: number; hard: number }> = {
+  Bash: { soft: 4000, hard: 10000 },
+  Grep: { soft: 4000, hard: 10000 },
+  WebFetch: { soft: 3000, hard: 6000 },
+  Glob: { soft: 150, hard: 300 },
+  Read: { soft: 80000, hard: 80000 },
+}
+
+export type Verdict = 'pass' | 'ask' | 'compact'
+
+// Pure size rule; the decider only ever sees the `ask` band.
+export const judgeSize = (tool: string, size: number, isError: boolean, factor = 1): Verdict => {
+  const limit = LIMITS[tool]
+  if (!limit) return 'pass'
+  const soft = limit.soft * factor
+  const hard = limit.hard * factor
+  if (size <= soft) return 'pass'
+  if (size > hard) return 'compact'
+  return isError ? 'pass' : 'ask'
 }

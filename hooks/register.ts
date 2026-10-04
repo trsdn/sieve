@@ -1,20 +1,23 @@
 import type { Register } from 'claude-code'
 import {
-  AUTO_INDEX_LIMIT,
+  LIMITS,
   RESULT_LIMIT,
+  buildSnapshot,
   chunkText,
+  compactText,
   ftsQuery,
   headTail,
   interpreter,
-  isBulkyCommand,
-  isRawFetch,
-  buildSnapshot,
+  judgeSize,
   sqlQuote,
 } from './lib'
 
 const PORT = 8765
 const DECIDER = `http://127.0.0.1:${PORT}/v1/systemone`
-const TOOL = (name: string) => `mcp__sieve__${name}`
+// Decider confidence needed before it may cut a mid-sized result / reshape the cut for a task.
+const VERBOSE_AT = 0.8
+const TASK_AT = 0.6
+const SEARCH = 'mcp__sieve__search'
 
 const text = (t: string) => ({ result: [{ type: 'text', text: t }] })
 
@@ -26,7 +29,24 @@ const TASKS = {
   question: 'a short question that needs an answer, not tool work',
 }
 
-const S = { checkedAt: 0, inner: false, session: '', db: '', deciderReady: false, kept: 0, indexed: 0, nudged: new Set<string>() }
+// How much of a result the current task tolerates: exploring wants less, debugging more.
+const FACTOR: Record<string, number> = { explore: 0.6, debug: 1.5 }
+
+const S = {
+  checkedAt: 0,
+  inner: false,
+  useDecider: true,
+  session: '',
+  db: '',
+  deciderReady: false,
+  factor: 1,
+  seen: 0,
+  kept: 0,
+  compacted: 0,
+  asked: 0,
+  askedYes: 0,
+  indexed: 0,
+}
 
 async function sql($: any, script: string) {
   const ran = await $.process.run(['sqlite3', S.db], { stdin: script, timeoutMs: 60000 })
@@ -47,7 +67,6 @@ async function snapshot($: any): Promise<string> {
   return events.length ? buildSnapshot(events, Number(compactions.trim() || 0) + 1) : ''
 }
 
-// The sandbox runs code the model wrote, so it answers to the same permission rules as Bash.
 async function permitted($: any, tool: string, input: Record<string, unknown>): Promise<string | undefined> {
   const { decision } = await $.tool.check({ tool, input })
   return decision === 'allow' ? undefined : `sieve: ${tool} ${decision === 'deny' ? 'is denied by your permission rules' : 'needs your approval; run it through the normal tool'}.`
@@ -84,13 +103,17 @@ async function index($: any, source: string, content: string): Promise<number> {
 async function search($: any, queries: string[], limit = 3): Promise<string> {
   const out: string[] = []
   for (const q of queries) {
-    const match = ftsQuery(q)
-    if (!match) continue
-    const raw = await sql(
-      $,
-      `.mode json\nselect source, title, snippet(chunks, 2, '[', ']', '…', 40) as hit from chunks where chunks match ${sqlQuote(match)} order by bm25(chunks) limit ${limit};`,
-    )
-    const rows: { source: string; title: string; hit: string }[] = raw.trim() ? JSON.parse(raw) : []
+    if (!ftsQuery(q)) continue
+    let rows: { source: string; title: string; hit: string }[] = []
+    // All terms first; any term only when nothing holds them all together.
+    for (const join of ['AND', 'OR'] as const) {
+      const raw = await sql(
+        $,
+        `.mode json\nselect source, title, snippet(chunks, 2, '[', ']', '…', 40) as hit from chunks where chunks match ${sqlQuote(ftsQuery(q, join))} order by bm25(chunks) limit ${limit};`,
+      )
+      rows = raw.trim() ? JSON.parse(raw) : []
+      if (rows.length) break
+    }
     out.push(
       `## ${q}\n` +
         (rows.map(r => `- ${r.source} › ${r.title}\n  ${r.hit.replaceAll('\n', ' ')}`).join('\n') || '(no matches)'),
@@ -100,6 +123,7 @@ async function search($: any, queries: string[], limit = 3): Promise<string> {
 }
 
 async function deciderUp($: any): Promise<boolean> {
+  if (!S.useDecider) return false
   const now = await $.clock.now()
   if (S.deciderReady || now - S.checkedAt < 30000) return S.deciderReady
   S.checkedAt = now
@@ -121,6 +145,7 @@ async function ask($: any, state: string, questions: Record<string, unknown>) {
     })
     return res.ok ? (JSON.parse(res.text).answers as Record<string, any>) : undefined
   } catch {
+    S.deciderReady = false
     return undefined
   }
 }
@@ -138,9 +163,87 @@ async function run($: any, language: string, code: string, timeoutMs: number, la
   return `${headTail(output)}\n[exit ${exit}] full output indexed as "${label}" (${chunks} chunks); use search to query it.`
 }
 
-export const register: Register = (on, options) => {
+// What a result carries as text, and the same result with that text replaced.
+function textOf(tool: string, r: any): string | undefined {
+  switch (tool) {
+    case 'Bash': return r.stdout
+    case 'Grep': return r.content
+    case 'WebFetch': return r.result
+    case 'Read': return r.file?.content
+    case 'Glob': return Array.isArray(r.filenames) ? r.filenames.join('\n') : undefined
+    default: return undefined
+  }
+}
+
+function withText(tool: string, r: any, t: string): any {
+  switch (tool) {
+    case 'Bash': return { ...r, stdout: t, persistedOutputPath: undefined, persistedOutputSize: undefined }
+    case 'Grep': return { ...r, content: t }
+    case 'WebFetch': return { ...r, result: t }
+    case 'Read': return { ...r, file: { ...r.file, content: t } }
+    default: return { ...r, filenames: t.split('\n'), truncated: true }
+  }
+}
+
+function describe(e: any): string {
+  return String(e.command ?? e.pattern ?? e.url ?? e.file_path ?? e.tool)
+}
+
+// The decider's one job on a result: is this mostly repetition a short excerpt can stand for?
+async function isVerbose($: any, e: any, full: string): Promise<boolean> {
+  const answers = await ask($, `${e.tool}: ${describe(e)}\n---\n${full.slice(0, 1500)}\n…\n${full.slice(-500)}`, {
+    verbose: {
+      type: 'noul',
+      instructions: 'Is this tool output mostly repetitive or low-value (logs, listings, progress, dependency trees), so that a short excerpt would be enough?',
+      criteria: {
+        true: 'long listings, logs, repeated lines, dependency trees, generated or minified data',
+        false: 'code, configuration, a single error with its cause, or an answer the reader needs in full',
+      },
+    },
+  })
+  const p = answers?.verbose?.noul
+  if (typeof p !== 'number') return false
+  S.asked += 1
+  if (p >= VERBOSE_AT) S.askedYes += 1
+  return p >= VERBOSE_AT
+}
+
+// Cuts a large built-in result in place: the model gets head, tail and the failure lines, the
+// whole output goes into the index. Undefined means leave the result as it is.
+async function compact($: any, e: any, ran: any): Promise<any | undefined> {
+  const r = ran.result
+  if (ran.deny !== undefined || !r || !LIMITS[e.tool]) return undefined
+  let full = textOf(e.tool, r)
+  if (typeof full !== 'string') return undefined
+  // Bash keeps a long output in a file and hands back a preview: index the file, not the preview.
+  if (r.persistedOutputPath) {
+    try {
+      full = await $.fs.read(r.persistedOutputPath)
+    } catch {
+      // over 4 MiB or gone: the preview is what there is
+    }
+  }
+  const size = e.tool === 'Glob' ? r.filenames.length : full.length
+  let verdict = judgeSize(e.tool, size, ran.isError === true, S.factor)
+  if (verdict === 'ask') verdict = (await isVerbose($, e, full)) ? 'compact' : 'pass'
+  if (verdict !== 'compact') return undefined
+
+  const source = `${e.tool}:${(await $.clock.now()).toString(36)}${++S.seen}`
+  const note = `[sieve: ${full.length} chars cut; the whole output is indexed as "${source}", query it with ${SEARCH}]`
+  const short =
+    e.tool === 'Glob'
+      ? [...full.split('\n').slice(0, 100), `… ${size - 100} more paths omitted. ${note}`].join('\n')
+      : `${compactText(full, { head: 1800, tail: 1200, signal: 15 })}\n${note}`
+  await index($, source, full)
+  S.kept += full.length - short.length
+  S.compacted += 1
+  return { result: withText(e.tool, r, short) }
+}
+
+export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const home = (await $.env.get('HOME')) ?? ''
+    S.useDecider = (await $.env.get('SIEVE_DECIDER')) !== '0'
     const dir = `${home}/.claude/sieve`
     S.db = `${dir}/index.db`
     S.session = await $.session.id()
@@ -150,63 +253,32 @@ export const register: Register = (on, options) => {
       `create virtual table if not exists chunks using fts5(source, title, body, tokenize='porter unicode61');\ncreate table if not exists events (session text, ts integer, kind text, data text);\ncreate table if not exists resume (session text primary key, snapshot text, count integer);`,
     )
 
-    const schema = (props: Record<string, unknown>, required: string[]) => ({
-      type: 'object',
-      properties: props,
-      required,
-    })
     await $.tool.register({
       name: 'execute',
       description:
-        'Run code (shell, python, javascript) in a sandbox and return only its printed output. Large output is indexed and cut to head and tail; pass `intent` to get matching passages back. Use instead of Bash when you only need an answer derived from data.',
-      inputSchema: schema(
-        {
+        'Run code (shell, python, javascript) in a sandbox and return only its printed output. Use it when you want an answer computed from data rather than the data itself.',
+      inputSchema: {
+        type: 'object',
+        properties: {
           language: { type: 'string', enum: ['shell', 'python', 'javascript'] },
           code: { type: 'string' },
-          intent: { type: 'string', description: 'What you are looking for in the output.' },
+          intent: { type: 'string', description: 'What you are looking for in a long output.' },
           timeout_ms: { type: 'number' },
         },
-        ['language', 'code'],
-      ),
-    })
-    await $.tool.register({
-      name: 'batch',
-      description:
-        'Run several shell commands, index every output, then answer `queries` from the index in one round trip.',
-      inputSchema: schema(
-        {
-          commands: {
-            type: 'array',
-            items: { type: 'object', properties: { label: { type: 'string' }, command: { type: 'string' } }, required: ['label', 'command'] },
-          },
-          queries: { type: 'array', items: { type: 'string' } },
-        },
-        ['commands', 'queries'],
-      ),
-    })
-    await $.tool.register({
-      name: 'index',
-      description: 'Index a local file or inline content for later search.',
-      inputSchema: schema(
-        { path: { type: 'string' }, content: { type: 'string' }, source: { type: 'string' } },
-        ['source'],
-      ),
-    })
-    await $.tool.register({
-      name: 'fetch',
-      description: 'Fetch a URL, index the page, and return only a short preview. Query it with search.',
-      inputSchema: schema({ url: { type: 'string' }, source: { type: 'string' } }, ['url']),
+        required: ['language', 'code'],
+      },
     })
     await $.tool.register({
       name: 'search',
-      description: 'Search everything indexed so far (BM25 over FTS5). Pass several related queries at once.',
-      inputSchema: schema({ queries: { type: 'array', items: { type: 'string' } }, limit: { type: 'number' } }, ['queries']),
+      description: 'Search output that was cut from earlier results (BM25). Pass several related queries at once.',
+      inputSchema: {
+        type: 'object',
+        properties: { queries: { type: 'array', items: { type: 'string' } }, limit: { type: 'number' } },
+        required: ['queries'],
+      },
     })
-    await $.command.register({ name: 'sieve', description: 'sieve: index size and decider status' })
-
-    // The decider is a shared service on this machine (see launchd/); nothing starts it here.
+    await $.command.register({ name: 'sieve', description: 'sieve: what was kept out of the context' })
     void deciderUp($)
-
     return next(e)
   })
 
@@ -214,7 +286,7 @@ export const register: Register = (on, options) => {
     const raw = await sql($, `.mode json\nselect count(*) as chunks, count(distinct source) as sources from chunks;`)
     const { chunks, sources } = JSON.parse(raw)[0]
     return {
-      text: `sieve: ${chunks} chunks from ${sources} sources indexed; ~${Math.round(S.kept / 1000)}k chars kept out of context this session; decider ${S.deciderReady ? 'ready' : 'off'}.`,
+      text: `sieve: ${S.compacted} results cut this session, ~${Math.round(S.kept / 1000)}k chars kept out of context; ${chunks} chunks from ${sources} sources indexed; decider ${S.deciderReady ? `ready, asked ${S.asked}x, said cut ${S.askedYes}x` : 'off'}.`,
     }
   })
 
@@ -225,112 +297,19 @@ export const register: Register = (on, options) => {
     return text(out)
   })
 
-  on('tool.call', { tool: 'mcp__sieve__batch' }, async ($, e: any) => {
-    const parts: string[] = []
-    for (const c of e.commands as { label: string; command: string }[]) {
-      const ran = await exec($, c.command, ['/bin/sh', '-c', c.command], 60000)
-      if ('denied' in ran) {
-        parts.push(`${c.label}: ${ran.denied}`)
-        continue
-      }
-      S.kept += ran.output.length
-      parts.push(`${c.label}: ${await index($, c.label, ran.output)} chunks, ${ran.output.length} chars, exit ${ran.exit}`)
-    }
-    return text(`${parts.join('\n')}\n\n${await search($, e.queries)}`)
-  })
+  on('tool.call', { tool: 'mcp__sieve__search' }, async ($, e: any) => text(await search($, e.queries, e.limit ?? 3)))
 
-  on('tool.call', { tool: 'mcp__sieve__index' }, async ($, e: any) => {
-    if (e.path) {
-      const denied = await permitted($, 'Read', { file_path: e.path })
-      if (denied) return text(denied)
-    }
-    const content = e.content ?? (e.path ? await $.fs.read(e.path) : '')
-    const n = await index($, e.source, String(content))
-    S.kept += String(content).length
-    return text(`indexed ${n} chunks as "${e.source}"`)
-  })
-
-  on('tool.call', { tool: 'mcp__sieve__fetch' }, async ($, e: any) => {
-    const res = await $.http.fetch(e.url)
-    const n = await index($, e.source ?? e.url, res.text)
-    S.kept += res.text.length
-    return text(`${res.status} ${e.url}: indexed ${n} chunks.\n${res.text.slice(0, 500)}`)
-  })
-
-  on('tool.call', { tool: 'mcp__sieve__search' }, async ($, e: any) =>
-    text(await search($, e.queries, e.limit ?? 3)),
-  )
-
-  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    if (S.inner) return next(e)
-    const command: string = e.command
-    if (isRawFetch(command))
-      return { deny: `sieve: use ${TOOL('fetch')} for URLs, or send the output to a file or through head/jq.` }
-
-    let bulky = isBulkyCommand(command)
-    if (!bulky && command.length > 12 && !S.nudged.has(command)) {
-      const answers = await ask($, command, {
-        bulky: { type: 'noul', instructions: 'Will running this shell command print more than 200 lines of output?' },
-      })
-      bulky = (answers?.bulky?.noul ?? 0) >= 0.9
-    }
-    if (bulky && !S.nudged.has(command)) {
-      S.nudged.add(command)
-      return {
-        deny: `sieve: this will likely print a lot. Run it through ${TOOL('execute')} with an \`intent\`, or limit it (head, grep, --stat). Repeat the same command to run it as is.`,
-      }
-    }
-
-    const ran = await next(e)
-    if (ran.deny === undefined && typeof ran.text === 'string' && ran.text.length > AUTO_INDEX_LIMIT) {
-      S.kept += ran.text.length
-      const source = `bash:${command.slice(0, 60)}`
-      const n = await index($, source, ran.text)
-      return {
-        ...ran,
-        context: [...(ran.context ?? []), `sieve: that output was ${ran.text.length} chars; indexed as "${source}" (${n} chunks). Query it with ${TOOL('search')} instead of rerunning.`],
-      }
-    }
-    return ran
-  })
-
-  on('tool.call', { tool: 'WebFetch' }, async () => ({
-    deny: `sieve: use ${TOOL('fetch')} then ${TOOL('search')}; it keeps the page out of the context.`,
-  }))
-
-  on('prompt.submit', async ($, e, next) => {
-    await record($, 'prompt', e.text.slice(0, 200)).catch(() => {})
-    const answers = await ask($, e.text.slice(0, 4000), {
-      task: {
-        type: 'choice',
-        instructions: 'What kind of work does this request mainly ask for?',
-        criteria: TASKS,
-      },
-    })
-    const task = answers?.task
-    if (task && task.confidence >= 0.8 && ['explore', 'debug', 'review'].includes(task.choice)) {
-      $.ui.status(`ctx: ${task.choice} ${Math.round(task.confidence * 100)}%`)
-      return next({
-        ...e,
-        context: [
-          ...(e.context ?? []),
-          `sieve: this looks like ${task.choice} work. Gather files, logs and command output with ${TOOL('batch')} or ${TOOL('execute')} and query the index, rather than reading raw output into the context.`,
-        ],
-      })
-    }
-    $.ui.status(undefined)
-    return next(e)
-  })
-
+  // Every built-in result passes here: recorded for the resume note, cut when it is large.
   on('tool.call', async ($, e: any, next) => {
     const ran = await next(e)
+    if (S.inner || e.tool.startsWith('mcp__sieve__')) return ran
     try {
       if (['Edit', 'Write', 'NotebookEdit'].includes(e.tool) && ran.deny === undefined) await record($, 'file', e.file_path ?? e.notebook_path)
       else if (e.tool === 'Bash' && ran.deny === undefined) await record($, ran.isError ? 'error' : 'command', e.command)
+      return (await compact($, e, ran)) ?? ran
     } catch {
-      // capture must never break a tool call
+      return ran
     }
-    return ran
   })
 
   on('session.compact', async ($, e, next) => {
@@ -356,5 +335,22 @@ export const register: Register = (on, options) => {
       // no note, no section
     }
     return composed
+  })
+
+  // The decider reads the prompt and sets how hard results are cut for this turn.
+  on('prompt.submit', async ($, e, next) => {
+    S.factor = 1
+    await record($, 'prompt', e.text.slice(0, 200)).catch(() => {})
+    const answers = await ask($, e.text.slice(0, 4000), {
+      task: { type: 'choice', instructions: 'What kind of work does this request mainly ask for?', criteria: TASKS },
+    })
+    const task = answers?.task
+    if (task && task.confidence >= TASK_AT && FACTOR[task.choice]) {
+      S.factor = FACTOR[task.choice]!
+      $.ui.status(`sieve: ${task.choice} ×${S.factor}`)
+    } else {
+      $.ui.status(undefined)
+    }
+    return next(e)
   })
 }
