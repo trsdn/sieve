@@ -20,6 +20,14 @@ STEPS = [
     ("How many public top-level functions (a def at column 0 whose name does not start with an underscore) does more_itertools/more.py define?", ["107"]),
     ("Without running anything: which function had the bug, and what exactly was wrong with it?", ["ilen"]),
 ]
+# BENCH_SCENARIO=hard: a session that starts with a trivial question and then needs real debugging
+# (a padding off-by-one in windowed(), committed, so git diff does not point at it).
+if os.environ.get("BENCH_SCENARIO") == "hard":
+    STEPS = [
+        ("What is the current git branch? Answer with the name only.", ["master"]),
+        ("Some tests are failing. Find the cause and fix it without changing the tests.", None),
+        ("In two sentences: what exactly was wrong?", ["padding|fill"]),
+    ]
 STEPS = STEPS[: int(os.environ.get('BENCH_STEPS', len(STEPS)))]
 TOOLS = "Bash,Read,Edit,Grep,Glob"
 VARIANTS = {
@@ -65,13 +73,13 @@ def session(job):
             rows.append({"variant": variant, "rep": rep, "step": n, "error": str(e)[:200]}); break
         sid = res.get("session_id", sid)
         ans = str(res.get("result", "")).lower()
-        ok = None if expected is None else all(x.lower() in ans for x in expected)
+        ok = None if expected is None else all(any(a.lower() in ans for a in x.split("|")) for x in expected)
         rows.append({"variant": variant, "rep": rep, "step": n, "correct": ok, "cost": res.get("total_cost_usd"), "turns": res.get("num_turns"),
                      "secs": round(time.time() - t0, 1), "answer": ans[:140], **m})
     suite = subprocess.run(["python3", "-m", "unittest", "discover", "-s", "tests"], cwd=cwd, capture_output=True, text=True, timeout=300)
     tests_changed = subprocess.run(["git", "diff", "--quiet", "--", "tests"], cwd=cwd).returncode != 0
     for r in rows:
-        if r.get("step") == 2:
+        if r.get("step") == 2:  # the fix step in both scenarios
             r["correct"] = suite.returncode == 0 and not tests_changed
     return rows
 

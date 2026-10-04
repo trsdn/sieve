@@ -72,7 +72,7 @@ Effort is set once per session and kept (a resumed session reads it back), becau
 
 Measured effects:
 - Effort, single quick questions on the real repository (12 sessions per setup): output tokens median 165 with the effort job, 194 without, 234 for no plugin; all 36 answers right; cost about 3% lower (short sessions are dominated by input).
-- Effort, the five-step repository session (3 sessions each, side by side): the first request is simple, so effort was `low` for all three sessions, including the bug fix. All 15 steps right in both; cost $0.154 against $0.196 (-21%), window-turns 206,565 against 235,578 (-12%). The bug is easy; a session that starts simple and turns hard is the risk, and it is not measured yet.
+- Effort, the five-step repository session (3 sessions each, side by side): all 15 steps right in both; cost $0.154 against $0.196. With 5 sessions on a harder bug (below) the difference was gone, so this was most likely variance. What holds: lowering the effort did no harm in 8 sessions that included a real bug fix.
 - Reminder, the verbose test step (5 runs): no gain over the guide alone (38k against 37k window-turns); the guide already does that work there. Kept because it costs one line.
 - New task, live over a resumed five-prompt session: only the unrelated prompt (a haiku in the middle of a bug fix) was flagged; the follow-ups before and after were not.
 
@@ -124,8 +124,8 @@ The closest to normal work: a copy of [more-itertools](https://github.com/more-i
 | first, 4 setups at once | no plugin | 15/15 | 254,883 | 11,340 | $0.200 |
 | | context-mode | 15/15 | 275,059 | 21,995 | $0.288 |
 | | sieve without the guide | 15/15 | 258,501 | 11,872 | $0.211 |
-| side by side, final code | no plugin | 15/15 | 259,318 | 5,319 | $0.163 |
-| | **sieve with the guide** | 15/15 | **207,173 (-20%)** | **4,125 (-22%)** | **$0.130 (-20%)** |
+| side by side, guide added (3 sessions) | no plugin | 15/15 | 259,318 | 5,319 | $0.163 |
+| | sieve with the guide | 15/15 | 207,173 | 4,125 | $0.130 |
 | side by side, ablation | sieve | 15/15 | 229,347 | 4,255 | $0.135 |
 | | sieve, decider off | 15/15 | 256,474 | 5,096 | $0.161 |
 
@@ -134,6 +134,10 @@ The closest to normal work: a copy of [more-itertools](https://github.com/more-i
 - Without the guide sieve equals no plugin here: in a normal session the outputs that would be cut are rare.
 - **The decider's share is not shown by this session.** In the ablation it made one decision in 25 minutes and kept that output whole; the 11% between the two lines is run-to-run variance. With the guide the model asks for small outputs, so the middle band where the decider works stays almost empty. Its value is in the cases measured further down (overview questions over large output), not in this one.
 - Costs move with prompt-cache state (compare the two no-plugin rows), so only rows run side by side are compared. 3 sessions per row.
+
+**Repeated with 5 sessions each, side by side, complete sieve (guide, filters, all decider jobs): no measurable difference.** No plugin 25/25 right, 230,864 window-turns, $0.186; sieve 25/25 right, 245,348 window-turns, $0.184 (`eval/repo_final.jsonl`). The -20% of the 3-session run above did not reproduce; run-to-run variance in these sessions is of the order of ±15%, so 3 sessions are not enough to show a 20% effect. Read every 3-session result in this README with that in mind.
+
+**A session that starts simple and turns hard** (`BENCH_SCENARIO=hard`: a trivial first question, so effort is set to `low`, then a padding off-by-one in `windowed()` that breaks 10 tests in two places and is committed so `git diff` does not show it; 5 sessions each, `eval/repo_hard.jsonl`): every fix was right in all setups (15/15), so the lower effort did no harm here; it also saved nothing (sieve $0.135, sieve without the effort job $0.125, no plugin $0.132).
 
 ### Long session (`eval/longbench.py`, `eval/long_report.py`)
 
