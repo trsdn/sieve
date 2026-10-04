@@ -15,8 +15,10 @@ import {
 const PORT = 8765
 const DECIDER = `http://127.0.0.1:${PORT}/v1/systemone`
 // Decider confidence needed before it may cut a mid-sized result / reshape the cut for a task.
-const VERBOSE_AT = 0.8
-const TASK_AT = 0.6
+const VERBOSE_AT = 0.6
+const TASK_AT = 0.4
+// Above this, the request is read as needing every line, and the output stays whole.
+const NEED_BELOW = 0.7
 const SEARCH = 'mcp__sieve__search'
 
 const text = (t: string) => ({ result: [{ type: 'text', text: t }] })
@@ -40,6 +42,7 @@ const S = {
   db: '',
   deciderReady: false,
   factor: 1,
+  prompt: '',
   seen: 0,
   kept: 0,
   compacted: 0,
@@ -191,21 +194,33 @@ function describe(e: any): string {
 
 // The decider's one job on a result: is this mostly repetition a short excerpt can stand for?
 async function isVerbose($: any, e: any, full: string): Promise<boolean> {
-  const answers = await ask($, `${e.tool}: ${describe(e)}\n---\n${full.slice(0, 1500)}\n…\n${full.slice(-500)}`, {
+  const request = S.prompt ? `Request: ${S.prompt}\n` : ''
+  const answers = await ask($, `${request}${e.tool}: ${describe(e)}\n---\n${full.slice(0, 1500)}\n…\n${full.slice(-500)}`, {
     verbose: {
-      type: 'noul',
-      instructions: 'Is this tool output mostly repetitive or low-value (logs, listings, progress, dependency trees), so that a short excerpt would be enough?',
+      type: 'choice',
+      instructions: 'What is the nature of this tool output?',
       criteria: {
-        true: 'long listings, logs, repeated lines, dependency trees, generated or minified data',
-        false: 'code, configuration, a single error with its cause, or an answer the reader needs in full',
+        repetitive: 'many similar lines: a listing, a log, progress output, a tree',
+        distinct: 'varied content that is read as a whole: code, configuration, prose, a stack trace',
+      },
+    },
+    need: {
+      type: 'choice',
+      instructions: 'To answer the request, how much of the output has to be read?',
+      criteria: {
+        'every line': 'the answer depends on counting, exact lookup or completeness over the whole output',
+        'a sample': 'a general idea, a summary or a check for obvious problems is enough',
       },
     },
   })
-  const p = answers?.verbose?.noul
-  if (typeof p !== 'number') return false
+  const repetitive = answers?.verbose?.probabilities?.repetitive
+  const everyLine = answers?.need?.probabilities?.['every line']
+  if (typeof repetitive !== 'number') return false
   S.asked += 1
-  if (p >= VERBOSE_AT) S.askedYes += 1
-  return p >= VERBOSE_AT
+  // Cut only a repetitive output the request does not need in full; no request known, no cut on that count.
+  const cut = repetitive >= VERBOSE_AT && (!S.prompt || (typeof everyLine === 'number' && everyLine < NEED_BELOW))
+  if (cut) S.askedYes += 1
+  return cut
 }
 
 // Cuts a large built-in result in place: the model gets head, tail and the failure lines, the
@@ -340,6 +355,7 @@ export const register: Register = on => {
   // The decider reads the prompt and sets how hard results are cut for this turn.
   on('prompt.submit', async ($, e, next) => {
     S.factor = 1
+    S.prompt = e.text.slice(0, 500)
     await record($, 'prompt', e.text.slice(0, 200)).catch(() => {})
     const answers = await ask($, e.text.slice(0, 4000), {
       task: { type: 'choice', instructions: 'What kind of work does this request mainly ask for?', criteria: TASKS },

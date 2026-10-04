@@ -113,9 +113,9 @@ export const compactText = (text: string, { head, tail, signal }: CompactOptions
 // Characters a result may carry before it is cut (`soft`), and above which it is cut without
 // asking the decider (`hard`). Glob counts paths, not characters.
 export const LIMITS: Record<string, { soft: number; hard: number }> = {
-  Bash: { soft: 4000, hard: 10000 },
-  Grep: { soft: 4000, hard: 10000 },
-  WebFetch: { soft: 3000, hard: 6000 },
+  Bash: { soft: 4000, hard: 30000 },
+  Grep: { soft: 4000, hard: 30000 },
+  WebFetch: { soft: 3000, hard: 12000 },
   Glob: { soft: 150, hard: 300 },
   Read: { soft: 80000, hard: 80000 },
 }

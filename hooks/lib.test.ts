@@ -54,8 +54,9 @@ test('judges size per tool, errors pass in the middle band', () => {
   expect(judgeSize('Bash', 100, false)).toBe('pass')
   expect(judgeSize('Bash', 6000, false)).toBe('ask')
   expect(judgeSize('Bash', 6000, true)).toBe('pass')
-  expect(judgeSize('Bash', 20000, true)).toBe('compact')
-  expect(judgeSize('Bash', 6000, false, 0.5)).toBe('compact')
+  expect(judgeSize('Bash', 40000, true)).toBe('compact')
+  expect(judgeSize('Bash', 20000, false)).toBe('ask')
+  expect(judgeSize('Bash', 20000, false, 0.5)).toBe('compact')
   expect(judgeSize('Edit', 999999, false)).toBe('pass')
 })
 
