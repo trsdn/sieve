@@ -88,6 +88,20 @@ sieve ends the session with a window 29% smaller than no plugin and a session 29
 
 Why context-mode does not help here, as far as the traces show: in two probe runs the model made only plain Bash and Grep calls and never a `ctx_*` call, so context-mode contributed its fixed cost (about 3-6k tokens of tool descriptions and routing text) and no cuts. Its method depends on the model choosing its tools, and a prompt that dictates the command overrides that. These prompts dictate the command by design (so large output cannot be avoided), which is not how context-mode is meant to be used: this test favours a transparent approach, and a fairer test for context-mode would let the model pick its own commands. Not run.
 
+### Long session, model chooses its own commands (`LONG_FREE=1`)
+
+The same nine questions, phrased naturally ("how many lines contain ERROR?"), results in `eval/long_free_results.jsonl`.
+
+| Setup | Window after step 1 | after step 5 | after step 9 | Session cost | Right |
+| --- | --- | --- | --- | --- | --- |
+| no plugin | 18,476 | 20,577 | 21,974 | $0.127 | 9/9 |
+| context-mode (repaired) | 21,854 | 32,066 | 40,696 | $0.221 | 9/9 |
+| sieve | 18,602 | 20,706 | 22,032 | $0.125 | 9/9 |
+
+- When it is free to choose, the model picks small commands (`grep -c`, `find | wc -l`); a session is about 10 built-in tool calls in all three setups, and **no plugin tool is called**, `ctx_*` included. So there is almost nothing for sieve to cut: it ends within 0.3% of no plugin and costs the same. This is the honest picture of what sieve does: it is insurance for large output, with a fixed cost of about zero, and no gain on sessions where the model never produces any.
+- context-mode ends 85% above no plugin and costs 74% more. The window grows by about 2.3k tokens per step, which points to its hooks rather than to tool output: its SessionStart hook injects about 5,000 characters of instructions, and its PreToolUse hooks attach a guidance note to every tool call (observed in a stream trace; the per-step growth was not itemised). In this setting it does not change what the model does, and the notes stay in the window.
+- Together with the first long test: context-mode only helped (not at all, in fact) where the tools are used; sieve helped where output is large and cost nothing where it is not.
+
 Caveats: 2 repetitions per setup, one generated project, one model, one kind of task.
 
 ### context-mode on this machine
@@ -97,3 +111,5 @@ The installed context-mode 1.0.169 (the latest release) did not start cleanly: i
 ## Status
 
 Tested in live `claude -p --plugin-dir .` sessions and the benchmarks above. Missing against context-mode: project-boundary path checks and per-project index separation. The compaction resume note is unit-tested but not exercised live.
+
+Its MCP server also checks for updates at start by fetching `https://registry.npmjs.org/context-mode/latest` directly (hard-coded, so it ignores `.npmrc` and any proxy). Behind a proxy that shows up as a blocked or unexpected npm request each time a context-mode instance starts. `eval/patch_context_mode_registry.py REGISTRY_URL PLUGIN_DIR` points the check at your registry (it reads `dist-tags.latest` from the package page, since many proxies do not serve `/latest`).

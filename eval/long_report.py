@@ -21,3 +21,14 @@ for v in sorted({r["variant"] for r in ok}):
 for r in ok:
     if not r["correct"]:
         print("MISS", r["variant"], "rep", r["rep"], "step", r["step"], r["answer"][:90])
+
+print("\ntool calls per session (median): ctx_* / sieve / other")
+for v in sorted({r["variant"] for r in ok}):
+    per = defaultdict(lambda: [0, 0])
+    for r in ok:
+        if r["variant"] != v:
+            continue
+        for t in r.get("tools", []):
+            per[r["rep"]][0 if ("ctx_" in t or "mcp__sieve" in t) else 1] += 1
+    if per:
+        print(f"  {v:14} plugin tools {st.median(x[0] for x in per.values()):.0f}, built-in {st.median(x[1] for x in per.values()):.0f}")

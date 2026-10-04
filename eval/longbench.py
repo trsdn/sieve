@@ -26,6 +26,19 @@ STEPS = [
     ("Run exactly `ls -laR deps` as written, no pipes, and tell me how many entries are named file_0.py." + T, ["file_0"]),  # any count: checks only that it answered
     ("Without running anything: which test failed earlier, and what were the expected and actual values?" + T, ["test_refund_rounding", "10.05", "10.04"]),
 ]
+# LONG_FREE=1: the same nine questions, but the model picks its own commands.
+if os.environ.get("LONG_FREE"):
+    STEPS = [
+        ("In logs/app.log, how many lines contain ERROR?" + T, ["54"]),
+        ("How many directories under deps/ are named sub_5?" + T, ["120"]),
+        ("Run the tests with `sh run_tests.sh` and tell me which test fails and why." + T, ["test_refund_rounding", "10.04"]),
+        ("Look at the git history: who authored the most commits?" + T, ["Mira Okafor"]),
+        ("In data/records.json, what is the price of the record with id 1100?" + T, [str(recs[100]["price"])]),
+        ("Which function in src/ has the most lines?" + T, ["rebuild_index"]),
+        ("What is the line number of the first ERROR line in logs/app.log?" + T, [str(first_err)]),
+        ("How many files named file_0.py are there under deps/?" + T, ["file_0"]),
+        ("Without running anything: which test failed earlier, and what were the expected and actual values?" + T, ["test_refund_rounding", "10.05", "10.04"]),
+    ]
 TOOLS = "Bash,Read,Grep,Glob"
 VARIANTS = {
     "base": ([], TOOLS, {}),
@@ -42,6 +55,7 @@ def call(variant, prompt, sid):
     p = subprocess.run(cmd, cwd=fixture, capture_output=True, text=True, timeout=420, stdin=subprocess.DEVNULL, env={**os.environ, **env})
     ev = [json.loads(l) for l in p.stdout.splitlines() if l.startswith("{")]
     res = next(e for e in ev if e.get("type") == "result")
+    res["_tools"] = [c["name"] for e in ev if e.get("type") == "assistant" for c in e["message"]["content"] if c["type"] == "tool_use"]
     last = [e for e in ev if e.get("type") == "assistant"][-1]["message"]["usage"]
     return res, last
 
@@ -62,7 +76,7 @@ def session(job):
             "variant": variant, "rep": rep, "step": n,
             "correct": all(x.lower() in ans for x in expected), "turns": res.get("num_turns"), "cost": res.get("total_cost_usd"),
             "ctx": last.get("input_tokens", 0) + last.get("cache_read_input_tokens", 0) + last.get("cache_creation_input_tokens", 0),
-            "secs": round(time.time() - t0, 1), "answer": ans[:120],
+            "secs": round(time.time() - t0, 1), "answer": ans[:120], "tools": res["_tools"],
         })
     return rows
 
