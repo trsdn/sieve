@@ -81,7 +81,8 @@ def session(job):
     return rows
 
 
-jobs = [(v, r) for r in range(reps) for v in VARIANTS]
+keep = set(os.environ.get('BENCH_VARIANTS', '').split(',')) - {''}
+jobs = [(v, r) for r in range(reps) for v in VARIANTS if not keep or v in keep]
 with ThreadPoolExecutor(3) as pool, open(out, "a") as f:
     for rows in pool.map(session, jobs):
         for r in rows:

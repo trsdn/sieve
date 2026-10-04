@@ -37,26 +37,31 @@ Pure logic lives in `hooks/lib.ts` with tests in `hooks/lib.test.ts`. Everything
 
 ## How it works
 
-Built-in results (Bash, Grep, Glob, WebFetch, Read) are rewritten in place after they ran. Nothing is refused and the model has nothing to learn.
+Results of Bash, Grep, Glob, WebFetch, any MCP tool that returns text, and Playwright snapshot files read back with `Read` are rewritten in place after they ran. Nothing is refused and the model has nothing to learn; the only tool is `mcp__sieve__search`.
 
-- Up to 4000 chars (Glob: 150 paths) a result is left alone; above 30000 it is cut. In between:
-  1. **A rule** (`isRepetitive`, no model) decides whether the output is repetitive: many lines of few shapes (digits and words blanked), such as a listing, a log or progress output. Code, config and prose are never cut on size alone.
-  2. **The decider** reads the request next to the output and answers one question: does answering need every line (counting, exact lookup) or is a sample enough? Cut only on "a sample" at 0.7. No answer means keep whole.
-- A cut result becomes a **summary of its structure**, not head and tail: a directory tree with counts by extension and folder, a per-file match table for Grep, or a table of line shapes with the rare and failure lines kept verbatim. The footer gives the path of the full output, so the model can `grep`/`wc` it in one call; the output is also indexed (`mcp__sieve__search`, BM25).
-- Session capture and resume note: edited files, commands, failures, prompts and what was indexed are recorded; before a compaction a note (max 2000 chars) is stored and added to the system prompt after it.
-- Measurement: `~/.claude/sieve/usage.jsonl` records tool and result size (no content) per call; `eval/usage_report.py` shows where the bytes of real sessions are. `/sieve` shows cuts, kept chars, and wrong cuts (the same call repeated within two calls of a cut).
-- `SIEVE_DECIDER=0` turns the decider off; the rule and size limits still apply.
+- Up to 4000 chars (Glob: 150 paths) a result is left alone. Other `Read`s are only cut above 80000 chars: code must stay whole.
+- In between, two checks, both must agree before anything is cut:
+  1. **A rule** (`isRepetitive`, no model): many lines of few shapes (digits and words blanked), such as a listing, a log, progress output or a table dump. Code, config and prose never pass.
+  2. **The decider** reads the request next to the output and answers one question: is it a *lookup or count* (how many, which, list all, find, exact) or an *overview* (what is this, does it look ok)? Cut only on overview. Anything at 0.5 or above for lookup keeps the output whole; no answer keeps it whole.
+- Above 30000 chars Bash and Grep results are cut without asking (the harness caps them anyway). MCP results and snapshot reads are never cut blind, up to 1 MB: a blind cut gave wrong answers in the browser test.
+- A cut result becomes a **summary of its structure**: a directory tree with counts by extension and folder, a per-file match table for Grep, or a table of line shapes with the rare and failure lines kept verbatim. The footer names the file with the whole output, so the model can `grep`/`wc` it; the output is also indexed (`mcp__sieve__search`, BM25).
+- **A repeated call** within two calls of a cut gets the whole output: the repeat is the signal that the cut was wrong.
+- The full output is written to `~/.claude/projects/<project>/<session>/tool-results/sieve-*.txt`, the harness's own folder, because the model can read it there with narrow permissions (tested with `Bash(grep:*)` only: 3.5 MB of Grep output became 3 KB and the model counted 39,946 matches in the file).
+- The index is one SQLite file per project (`~/.claude/sieve/<project>.db`); rows and files older than 14 days are deleted at session start.
+- Session capture and resume note: edited files, commands, failures, prompts and what was indexed; before a compaction a note (max 2000 chars) is stored and added to the system prompt after it.
+- Measurement: `~/.claude/sieve/usage.jsonl` (tool, size, verdict; no content), `eval/usage_report.py`; `/sieve` shows cuts, chars kept out, repeated calls restored, decider use; the status line shows chars kept out. `SIEVE_DECIDER=0` turns the decider off (the rule and size limits still apply, but then nothing in the middle band is cut).
+- There is no `execute` tool any more: it was never called in any test.
 
 ### What was measured, and what was not
 
 | Evaluation | Result |
 | --- | --- |
-| `eval/rule_eval.mjs`: rule vs 36 real outputs | 35/36 right; the miss is a stack trace repeated three times |
-| `eval/need_eval.py`: keep whole when the request needs every line, dev prompts | 30/30 at 0.7; cut when a sample is enough 24/30 |
-| same, hold-out prompts not used to pick the threshold | 25/25 kept whole; cut only 11/25, so recall is lower than the dev set suggested |
-| `eval/decider_eval.py`, `eval/task_eval.py` | earlier question designs; kept as the record of why "repetitive" became a rule and the prompt-class factor was dropped (unproven) |
+| `eval/rule_eval.mjs`: repetitive-or-not rule vs 36 real outputs | 35/36 right; the miss is a stack trace repeated three times |
+| `eval/need_eval2.py`: four question wordings, three prompt sets | The first wording (`every line` / `a sample`) kept the output whole every time but cut only 11-24 of 25-30 skim cases at a safe threshold. The wording "kind of question: lookup or count / overview" kept 85/85 whole at 0.5 and cut 83-85 of 85 |
+| `eval/need_eval3.py`: a harder set with no stock phrases (edits, checks on one line, worries) | lookup/overview at 0.5: kept whole 40/40, cut 35/40. The first wording at its safe threshold: kept 40/40, cut 20/40. Higher thresholds for the new wording lose needed output (0.7: 30/40 kept) |
+| `eval/decider_eval.py`, `eval/task_eval.py` | earlier designs; the record of why "repetitive" became a rule and the prompt-class factor was dropped |
 
-Higher thresholds cut more but stopped keeping everything the request needs (0.8: 23/25 on hold-out), so 0.7 stays: a wrong cut costs a round trip, a missed cut only some bytes.
+Over four prompt sets the chosen setting kept all 125 requests that need the whole output; the 0.5 threshold was picked on those same sets, and the first three sets share phrasing with the criteria, so read the cut rate (83-100%) as optimistic and the harder set (88%) as the better estimate. All prompts and outputs are small, hand-written and from one person.
 
 ## Benchmark (`eval/bench.py`, `eval/report.py`)
 
@@ -72,7 +77,7 @@ Higher thresholds cut more but stopped keeping everything the request needs (0.8
 - The decider's share: about 5k tokens (-12%) over rules alone on the tasks run so far; one more check with 5 repetitions per cell is still due.
 - context-mode, 5-task check after repairing its install (1 run per cell, so no more than a sanity check): all correct, about 6.4k tokens more per session than no plugin (tool descriptions), same turns.
 - Single runs vary a lot (`tests` took 3 to 7 turns for the same setup because the model explores differently), so differences under about 10% are noise. Cost is noisy too (prompt-cache hits); tokens and turns are steadier.
-- Not measured: interactive sessions, sessions long enough to compact, other models, the approval path of `execute`, wrong cuts in real use (`/sieve` counts them).
+- Not measured: interactive sessions (approval dialogs), sessions long enough to compact, other models, the approval path of `execute`, wrong cuts in real use (`/sieve` counts them).
 
 ### Long session (`eval/longbench.py`, `eval/long_report.py`)
 
@@ -102,6 +107,8 @@ The same nine questions, phrased naturally ("how many lines contain ERROR?"), re
 - context-mode ends 85% above no plugin and costs 74% more. The window grows by about 2.3k tokens per step, which points to its hooks rather than to tool output: its SessionStart hook injects about 5,000 characters of instructions, and its PreToolUse hooks attach a guidance note to every tool call (observed in a stream trace; the per-step growth was not itemised). In this setting it does not change what the model does, and the notes stay in the window.
 - Together with the first long test: context-mode only helped (not at all, in fact) where the tools are used; sieve helped where output is large and cost nothing where it is not.
 
+**Repeated with the final code, 3 repetitions, no plugin vs sieve** (`eval/long_results_v2.jsonl`): window after step 9 49,113 vs 45,737 tokens (-7%), session cost $0.343 vs $0.331, sieve right in 27/27 steps, no plugin in 25/27 (twice the model could not find the failing test because the harness cut the test output in the middle; sieve's summary keeps rare and failure lines). The gap to the first batch is the no-plugin session: it ended at 61k tokens in the first batch and 49k in the second, because the model solved some steps with smaller commands. Treat the saving as somewhere between 7% and 29% on this fixture, not as a number.
+
 Caveats: 2 repetitions per setup, one generated project, one model, one kind of task.
 
 ### Browser test: large pages through the Playwright MCP (`eval/webbench.py`, `eval/web_report.py`)
@@ -122,7 +129,8 @@ The case context-mode's README is about: a 20-40 KB page that arrives as a snaps
 - When the model uses the `ctx_*` tools the saving is real: the end context is 14% below no plugin, and on the question that needs a computation over every row (`orders-over-500`) tokens drop from 145k to 101k (-31%). So the README's claim holds for the case it describes **if the tools are used**.
 - Left to itself the model did not use them (0 calls), and then context-mode was clearly worse than no plugin here (+56% tokens, +15k tokens of end context; why the end context is larger was not investigated).
 - Over all three questions the told setup only breaks even with no plugin on tokens (102k vs 103k): the saving appears on the compute-heavy question and vanishes on the others.
-- sieve does not touch MCP results or reads under 80,000 characters, so it should equal no plugin here; it ran 18% above on tokens, driven by one question (`top-customer`) where the model took a different route in 3 runs. Read that as variance, not as an effect. It also means sieve gives no help for this case.
+- sieve, first version (no MCP handling): equal to no plugin, as expected.
+- sieve with MCP and snapshot handling, **first try: 44% correct** (`eval/web_snapshot_v2.jsonl`, no plugin 100%, 9 runs each). Cause: a 41 KB snapshot was above a blind-cut limit of 30,000 characters and was summarised although the question needed every row, so the numbers were wrong. Fix: MCP results and snapshot reads are never cut without the decider (see above). **After the fix: 9/9 correct**, tokens equal to no plugin (147k, `eval/web_snapshot_v3.jsonl`). So sieve keeps these pages whole when the question needs them and saves nothing here; it would cut only for an overview question.
 
 ### context-mode on this machine
 

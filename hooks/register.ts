@@ -1,14 +1,11 @@
 import type { Register } from 'claude-code'
 import {
   LIMITS,
-  isRepetitive,
-  RESULT_LIMIT,
   buildSnapshot,
   chunkText,
   compactText,
   ftsQuery,
-  headTail,
-  interpreter,
+  isRepetitive,
   judgeSize,
   sqlQuote,
   summarize,
@@ -16,24 +13,25 @@ import {
 
 const PORT = 8765
 const DECIDER = `http://127.0.0.1:${PORT}/v1/systemone`
-// Decider confidence needed before it may cut a mid-sized result / reshape the cut for a task.
-// Above this, the request is read as needing every line, and the output stays whole.
-const NEED_BELOW = 0.7
+// At or above this, the request is a lookup or a count, and the output stays whole.
+// Chosen on four prompt sets (125 requests that need the whole output, none cut); see eval/need_eval2.py and need_eval3.py.
+const LOOKUP_AT = 0.5
 const SEARCH = 'mcp__sieve__search'
+const KEEP_DAYS = 14
 
 const text = (t: string) => ({ result: [{ type: 'text', text: t }] })
 
 const S = {
   checkedAt: 0,
-  inner: false,
   useDecider: true,
   session: '',
   db: '',
   deciderReady: false,
   dir: '',
+  out: '',
   cuts: [] as { what: string; left: number }[],
   recut: 0,
-  executed: 0,
+  restored: 0,
   prompt: '',
   seen: 0,
   kept: 0,
@@ -62,35 +60,13 @@ async function snapshot($: any): Promise<string> {
   return events.length ? buildSnapshot(events, Number(compactions.trim() || 0) + 1) : ''
 }
 
-async function permitted($: any, tool: string, input: Record<string, unknown>): Promise<string | undefined> {
-  const { decision } = await $.tool.check({ tool, input })
-  return decision === 'allow' ? undefined : `sieve: ${tool} ${decision === 'deny' ? 'is denied by your permission rules' : 'needs your approval; run it through the normal tool'}.`
-}
-
-// Runs a command in the sandbox when the rules allow it outright. When they would ask, the
-// real Bash tool carries the call so the person sees the dialog; the output is still ours.
-async function exec($: any, command: string, argv: string[], timeoutMs: number): Promise<{ output: string; exit: string } | { denied: string }> {
-  const { decision } = await $.tool.check({ tool: 'Bash', input: { command } })
-  if (decision === 'deny') return { denied: 'sieve: denied by your permission rules.' }
-  if (decision === 'allow') {
-    const ran = await $.process.run(argv, { timeoutMs })
-    return { output: `${ran.stdout}${ran.stderr ? `\n[stderr]\n${ran.stderr}` : ''}`.trim(), exit: String(ran.exitCode) }
-  }
-  S.inner = true
-  try {
-    const r = await $.tool.call({ tool: 'Bash', command, timeout: timeoutMs })
-    return r.deny === undefined ? { output: String(r.text ?? '').trim(), exit: r.isError ? 'error' : '0' } : { denied: r.deny }
-  } finally {
-    S.inner = false
-  }
-}
-
 async function index($: any, source: string, content: string): Promise<number> {
   const chunks = chunkText(content, source)
   const rows = chunks
     .map(c => `insert into chunks values (${sqlQuote(source)}, ${sqlQuote(c.title)}, ${sqlQuote(c.body)});`)
     .join('\n')
-  await sql($, `begin;\ndelete from chunks where source = ${sqlQuote(source)};\n${rows}\ncommit;`)
+  const ts = await $.clock.now()
+  await sql($, `begin;\ndelete from chunks where source = ${sqlQuote(source)};\n${rows}\ninsert or replace into sources values (${sqlQuote(source)}, ${ts});\ncommit;`)
   S.indexed += chunks.length
   return chunks.length
 }
@@ -145,22 +121,22 @@ async function ask($: any, state: string, questions: Record<string, unknown>) {
   }
 }
 
-async function run($: any, language: string, code: string, timeoutMs: number, label: string) {
-  const argv = interpreter(language, code)
-  if (!argv) return `unsupported language: ${language} (shell, python, javascript)`
-  const command = argv[0] === '/bin/sh' ? code : `${argv[0]} ${argv[1]} ${JSON.stringify(code)}`
-  const ran = await exec($, command, argv, timeoutMs)
-  if ('denied' in ran) return ran.denied
-  const { output, exit } = ran
-  if (output.length <= RESULT_LIMIT) return `${output || '(no output)'}\n[exit ${exit}]`
-  S.kept += output.length - RESULT_LIMIT
-  const chunks = await index($, label, output)
-  return `${headTail(output)}\n[exit ${exit}] full output indexed as "${label}" (${chunks} chunks); use search to query it.`
+// Which size limits apply to a call: any MCP result, a Playwright snapshot file read back, or the built-in tool.
+function limitKey(e: any): string {
+  if (e.tool.startsWith('mcp__')) return 'mcp'
+  if (e.tool === 'Read' && /\/\.playwright-mcp\//.test(String(e.file_path))) return 'ReadSnapshot'
+  return e.tool
 }
 
+const blocksOf = (r: any): any[] | undefined => (Array.isArray(r) ? r : Array.isArray(r?.content) ? r.content : undefined)
+
 // What a result carries as text, and the same result with that text replaced.
-function textOf(tool: string, r: any): string | undefined {
-  switch (tool) {
+function textOf(e: any, r: any): string | undefined {
+  if (e.tool.startsWith('mcp__')) {
+    const blocks = blocksOf(r)
+    return blocks && blocks.length && blocks.every(b => b?.type === 'text' && typeof b.text === 'string') ? blocks.map(b => b.text).join('\n\n') : undefined
+  }
+  switch (e.tool) {
     case 'Bash': return r.stdout
     case 'Grep': return r.content
     case 'WebFetch': return r.result
@@ -170,8 +146,9 @@ function textOf(tool: string, r: any): string | undefined {
   }
 }
 
-function withText(tool: string, r: any, t: string): any {
-  switch (tool) {
+function withText(e: any, r: any, t: string): any {
+  if (e.tool.startsWith('mcp__')) return Array.isArray(r) ? [{ type: 'text', text: t }] : { ...r, content: [{ type: 'text', text: t }] }
+  switch (e.tool) {
     case 'Bash': return { ...r, stdout: t, persistedOutputPath: undefined, persistedOutputSize: undefined }
     case 'Grep': return { ...r, content: t }
     case 'WebFetch': return { ...r, result: t }
@@ -180,8 +157,10 @@ function withText(tool: string, r: any, t: string): any {
   }
 }
 
+// A short, stable label for what was called: how a repeat is recognised.
 function describe(e: any): string {
-  return String(e.command ?? e.pattern ?? e.url ?? e.file_path ?? e.tool)
+  const { tool, tool_use_id, consent, ...input } = e
+  return String(e.command ?? e.pattern ?? e.url ?? e.file_path ?? `${tool} ${JSON.stringify(input).slice(0, 160)}`)
 }
 
 // The decider's one job on a result: does the request need every line of it? The rule has
@@ -189,19 +168,19 @@ function describe(e: any): string {
 async function needsEveryLine($: any, e: any, full: string): Promise<boolean> {
   if (!S.prompt) return true
   const answers = await ask($, `Request: ${S.prompt}\n${e.tool}: ${describe(e)}\n---\n${full.slice(0, 1500)}\n…\n${full.slice(-500)}`, {
-    need: {
+    kind: {
       type: 'choice',
-      instructions: 'To answer the request, how much of the output has to be read?',
+      instructions: 'Which kind of question is the request?',
       criteria: {
-        'every line': 'the answer depends on counting, exact lookup or completeness over the whole output',
-        'a sample': 'a general idea, a summary or a check for obvious problems is enough',
+        'lookup or count': 'how many, which one, list all, find, exists, exact',
+        overview: 'what is this, summarize, describe, does it look ok, any sign of trouble',
       },
     },
   })
-  const p = answers?.need?.probabilities?.['every line']
+  const p = answers?.kind?.probabilities?.['lookup or count']
   S.asked += 1
   // No answer means keep it whole: a wrong cut costs a round trip, a missed cut only some bytes.
-  if (typeof p !== 'number' || p >= NEED_BELOW) return true
+  if (typeof p !== 'number' || p >= LOOKUP_AT) return true
   S.askedYes += 1
   return false
 }
@@ -214,22 +193,27 @@ async function logUsage($: any, line: Record<string, unknown>) {
   }
 }
 
-// A cut that is followed within two calls by the same command or file read again was a wrong cut.
-function watchRecut(e: any) {
+// A cut followed within two calls by the same call again was a wrong cut: the repeat gets the whole output.
+function watchRepeat(e: any): boolean {
+  const what = describe(e)
+  let repeat = false
   for (const c of S.cuts) {
     if (c.left <= 0) continue
+    if (c.what === what) repeat = true
     c.left -= 1
-    if (describe(e) === c.what && c.left >= 0) S.recut += 1
   }
-  S.cuts = S.cuts.filter(c => c.left > 0)
+  S.cuts = S.cuts.filter(c => c.left > 0 && !(repeat && c.what === what))
+  if (repeat) S.recut += 1
+  return repeat
 }
 
-// Cuts a large built-in result in place: the model gets a summary of its structure, the whole
-// output stays in a file and in the index. Undefined means leave the result as it is.
+// Cuts a large result in place: the model gets a summary of its structure, the whole output
+// stays in a file and in the index. Undefined means leave the result as it is.
 async function compact($: any, e: any, ran: any): Promise<any | undefined> {
   const r = ran.result
-  if (ran.deny !== undefined || !r || !LIMITS[e.tool]) return undefined
-  let full = textOf(e.tool, r)
+  const key = limitKey(e)
+  if (ran.deny !== undefined || !r || !LIMITS[key]) return undefined
+  let full = textOf(e, r)
   if (typeof full !== 'string') return undefined
   // Bash keeps a long output in a file and hands back a preview: use the file, not the preview.
   let path: string | undefined = r.persistedOutputPath
@@ -241,58 +225,53 @@ async function compact($: any, e: any, ran: any): Promise<any | undefined> {
     }
   }
   const size = e.tool === 'Glob' ? r.filenames.length : full.length
-  const verdict = judgeSize(e.tool, size, ran.isError === true, 1)
+  const verdict = judgeSize(key, size, ran.isError === true, 1)
   const repetitive = e.tool === 'Glob' || isRepetitive(full)
   let cut = verdict === 'compact'
   if (verdict === 'ask' && repetitive) cut = !(await needsEveryLine($, e, full))
-  await logUsage($, { tool: e.tool, size, verdict, repetitive, cut })
+  await logUsage($, { tool: key === 'mcp' ? 'mcp' : e.tool, size, verdict, repetitive, cut })
   if (!cut) return undefined
 
-  const source = `${e.tool}:${(await $.clock.now()).toString(36)}${++S.seen}`
+  const source = `${e.tool}:${(await $.clock.now()).toString(36)}${++S.seen}`.replace(/[^\w.:-]/g, '_')
   if (!path) {
-    path = `${S.dir}/out/${source.replace(/[^\w.-]/g, '_')}.txt`
+    path = `${S.out}/sieve-${source.replace(/:/g, '-')}.txt`
     await $.fs.write(path, full)
   }
-  const foot = `[sieve: ${full.length} chars summarised. Full output: ${path}. For exact counts or lookups run grep/wc/awk on that file; ${SEARCH} finds passages.]`
+  const foot = `[sieve: ${full.length} chars summarised. Full output: ${path}. For exact counts or lookups run grep/wc/awk on that file; ${SEARCH} finds passages. Repeat the same call to get everything.]`
   const short = repetitive ? `${summarize(e.tool, full)}\n${foot}` : `${compactText(full, { head: 1800, tail: 1200, signal: 15 })}\n${foot}`
   await index($, source, full)
   await record($, 'cut', `${source} ${describe(e)}`)
   S.cuts.push({ what: describe(e), left: 2 })
   S.kept += full.length - short.length
   S.compacted += 1
-  return { result: withText(e.tool, r, short) }
+  $.ui.status(`sieve: ${Math.round(S.kept / 1000)}k chars kept out`)
+  return { result: withText(e, r, short) }
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const home = (await $.env.get('HOME')) ?? ''
     S.useDecider = (await $.env.get('SIEVE_DECIDER')) !== '0'
-    const dir = `${home}/.claude/sieve`
-    S.db = `${dir}/index.db`
-    S.dir = dir
+    const slug = e.cwd.replace(/[/.]/g, '-')
+    S.dir = `${home}/.claude/sieve`
+    S.db = `${S.dir}/${slug}.db`
     S.session = await $.session.id()
-    await $.process.run(['mkdir', '-p', `${dir}/out`])
-    await $.process.run(['find', `${dir}/out`, '-type', 'f', '-mtime', '+7', '-delete'])
+    // The harness's own folder for long outputs: the model may read it without asking.
+    S.out = `${home}/.claude/projects/${slug}/${S.session}/tool-results`
+    await $.process.run(['mkdir', '-p', S.dir, S.out])
+    const cutoff = (await $.clock.now()) - KEEP_DAYS * 86400000
     await sql(
       $,
-      `create virtual table if not exists chunks using fts5(source, title, body, tokenize='porter unicode61');\ncreate table if not exists events (session text, ts integer, kind text, data text);\ncreate table if not exists resume (session text primary key, snapshot text, count integer);`,
+      `create virtual table if not exists chunks using fts5(source, title, body, tokenize='porter unicode61');
+create table if not exists sources (source text primary key, ts integer);
+create table if not exists events (session text, ts integer, kind text, data text);
+create table if not exists resume (session text primary key, snapshot text, count integer);
+delete from chunks where source in (select source from sources where ts < ${cutoff});
+delete from sources where ts < ${cutoff};
+delete from events where ts < ${cutoff};`,
     )
+    await $.process.run(['find', `${home}/.claude/projects`, '-name', 'sieve-*.txt', '-mtime', `+${KEEP_DAYS}`, '-delete'])
 
-    await $.tool.register({
-      name: 'execute',
-      description:
-        'Run code (shell, python, javascript) in a sandbox and return only its printed output. Use it when you want an answer computed from data rather than the data itself.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          language: { type: 'string', enum: ['shell', 'python', 'javascript'] },
-          code: { type: 'string' },
-          intent: { type: 'string', description: 'What you are looking for in a long output.' },
-          timeout_ms: { type: 'number' },
-        },
-        required: ['language', 'code'],
-      },
-    })
     await $.tool.register({
       name: 'search',
       description: 'Search output that was cut from earlier results (BM25). Pass several related queries at once.',
@@ -311,30 +290,26 @@ export const register: Register = on => {
     const raw = await sql($, `.mode json\nselect count(*) as chunks, count(distinct source) as sources from chunks;`)
     const { chunks, sources } = JSON.parse(raw)[0]
     return {
-      text: `sieve: ${S.compacted} results cut this session, ~${Math.round(S.kept / 1000)}k chars kept out of context; ${chunks} chunks from ${sources} sources indexed; wrong cuts (same call repeated within 2) ${S.recut}; decider ${S.deciderReady ? `ready, asked ${S.asked}x, allowed a cut ${S.askedYes}x` : 'off'}.`,
+      text: `sieve: ${S.compacted} results cut this session, ~${Math.round(S.kept / 1000)}k chars kept out of context; ${S.restored} repeated calls got the whole output; ${chunks} chunks from ${sources} sources indexed (this project); decider ${S.deciderReady ? `ready, asked ${S.asked}x, allowed a cut ${S.askedYes}x` : 'off'}.`,
     }
-  })
-
-  on('tool.call', { tool: 'mcp__sieve__execute' }, async ($, e: any) => {
-    S.executed += 1
-    await logUsage($, { tool: 'sieve.execute' })
-    const label = `execute:${e.language}:${(await $.clock.now()).toString(36)}`
-    let out = await run($, e.language, e.code, e.timeout_ms ?? 30000, label)
-    if (e.intent && out.includes('full output indexed')) out += `\n\n${await search($, [e.intent])}`
-    return text(out)
   })
 
   on('tool.call', { tool: 'mcp__sieve__search' }, async ($, e: any) => text(await search($, e.queries, e.limit ?? 3)))
 
-  // Every built-in result passes here: recorded for the resume note, cut when it is large.
+  // Every result passes here: recorded for the resume note, cut when it is large.
   on('tool.call', async ($, e: any, next) => {
-    if (!S.inner && !e.tool.startsWith('mcp__sieve__')) watchRecut(e)
+    if (e.tool.startsWith('mcp__sieve__')) return next(e)
+    const repeat = watchRepeat(e)
     const ran = await next(e)
-    if (S.inner || e.tool.startsWith('mcp__sieve__')) return ran
-    if (!LIMITS[e.tool]) await logUsage($, { tool: e.tool, size: String(ran.text ?? '').length })
+    if (!LIMITS[limitKey(e)]) await logUsage($, { tool: e.tool, size: String(ran.text ?? '').length })
     try {
       if (['Edit', 'Write', 'NotebookEdit'].includes(e.tool) && ran.deny === undefined) await record($, 'file', e.file_path ?? e.notebook_path)
       else if (e.tool === 'Bash' && ran.deny === undefined) await record($, ran.isError ? 'error' : 'command', e.command)
+      if (repeat) {
+        S.restored += 1
+        await logUsage($, { tool: e.tool, restored: true })
+        return ran
+      }
       return (await compact($, e, ran)) ?? ran
     } catch {
       return ran

@@ -102,3 +102,12 @@ test('a list of distinct names is still repetitive', () => {
   const names = Array.from({ length: 80 }, (_, i) => `${['numpy', 'torch', 'requests', 'click'][i % 4]}${'abcdefghij'[i % 10]}${'q'.repeat(i % 6)} ${i % 3}.${i % 7}.${i}`).join('\n')
   expect(isRepetitive(names)).toBe(true)
 })
+
+test('mcp results and playwright snapshots have their own limits', () => {
+  expect(judgeSize('mcp', 2000, false)).toBe('pass')
+  expect(judgeSize('mcp', 12000, false)).toBe('ask')
+  expect(judgeSize('mcp', 40000, false)).toBe('ask')
+  expect(judgeSize('mcp', 2000000, false)).toBe('compact')
+  expect(judgeSize('ReadSnapshot', 12000, false)).toBe('ask')
+  expect(judgeSize('Read', 12000, false)).toBe('pass')
+})

@@ -61,7 +61,7 @@ def one(job):
     }
 
 
-jobs = [(v, t, r) for r in range(reps) for t in TASKS for v in VARIANTS]
+jobs = [(v, t, r) for r in range(reps) for t in TASKS for v in VARIANTS if not (set(os.environ.get('BENCH_VARIANTS', '').split(',')) - {''}) or v in os.environ.get('BENCH_VARIANTS', '').split(',')]
 with ThreadPoolExecutor(2) as pool, open(out, "a") as f:
     for res in pool.map(one, jobs):
         f.write(json.dumps(res) + "\n"); f.flush()

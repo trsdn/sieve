@@ -119,6 +119,10 @@ export const LIMITS: Record<string, { soft: number; hard: number }> = {
   WebFetch: { soft: 3000, hard: 12000 },
   Glob: { soft: 150, hard: 300 },
   Read: { soft: 80000, hard: 80000 },
+  // Any MCP result made of text, and a Playwright snapshot file read back: data, not code.
+  // No blind cut here: the decider always weighs the request first (a blind cut at 30000 gave wrong answers in the browser test).
+  mcp: { soft: 4000, hard: 1000000 },
+  ReadSnapshot: { soft: 4000, hard: 1000000 },
 }
 
 export type Verdict = 'pass' | 'ask' | 'compact'
