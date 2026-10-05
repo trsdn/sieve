@@ -3,6 +3,7 @@
 usage: simplebench.py TEMPLATE_DIR OUT.jsonl REPS"""
 import json, os, shutil, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
+MODEL = os.environ.get("BENCH_MODEL", "claude-opus-5-5")  # pinned: the runs in the README used this model
 template, out, reps = os.path.abspath(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 SIEVE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 cwd = os.path.expanduser("~/dev/sieve-bench-runs/simple")
@@ -19,7 +20,7 @@ VARIANTS = {"base": ([], {}), "sieve": (["--plugin-dir", SIEVE], {}), "sieve-no-
 def one(job):
     v, t, r = job
     flags, env = VARIANTS[v]; prompt, exp = TASKS[t]
-    p = subprocess.run(["claude", "-p", prompt, "--output-format", "json", "--setting-sources", "project", *flags, "--allowedTools", "Bash,Read,Grep,Glob"],
+    p = subprocess.run(["claude", "-p", prompt, "--output-format", "json", "--setting-sources", "project", "--model", MODEL, *flags, "--allowedTools", "Bash,Read,Grep,Glob"],
                        cwd=cwd, capture_output=True, text=True, stdin=subprocess.DEVNULL, env={**os.environ, **env}, timeout=300)
     try:
         d = json.loads(p.stdout)

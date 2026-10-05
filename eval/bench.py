@@ -6,11 +6,12 @@ Each run is `claude -p --output-format json` in the fixture; tokens and cost com
 """
 import json, os, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
+MODEL = os.environ.get("BENCH_MODEL", "claude-opus-5-5")  # pinned: the runs in the README used this model
 
 fixture, out, reps = os.path.abspath(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 only = set(sys.argv[4:])
 home = os.path.expanduser("~")
-CM = os.environ.get("CM_DIR", "/tmp/claude-501/cm-repaired")  # a copy of the installed plugin with its dependencies installed
+CM = os.environ.get("CM_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".scratch", "context-mode"))  # a copy of the installed plugin with its dependencies installed
 SIEVE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TAIL = " Answer in one short sentence."
 
@@ -63,7 +64,7 @@ def one(job):
     variant, task, rep = job
     flags, tools, env = VARIANTS[variant]
     prompt, expected = TASKS[task]
-    cmd = ["claude", "-p", prompt + TAIL, "--output-format", "stream-json", "--verbose", "--setting-sources", "project", *flags, "--allowedTools", tools]
+    cmd = ["claude", "-p", prompt + TAIL, "--output-format", "stream-json", "--verbose", "--setting-sources", "project", "--model", MODEL, *flags, "--allowedTools", tools]
     t0 = time.time()
     try:
         p = subprocess.run(cmd, cwd=fixture, capture_output=True, text=True, timeout=420, stdin=subprocess.DEVNULL, env={**os.environ, **env})

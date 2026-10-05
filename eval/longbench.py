@@ -6,11 +6,12 @@ usage: longbench.py FIXTURE OUT.jsonl REPS
 """
 import json, os, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
+MODEL = os.environ.get("BENCH_MODEL", "claude-opus-5-5")  # pinned: the runs in the README used this model
 
 fixture, out, reps = os.path.abspath(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 home = os.path.expanduser("~")
 SIEVE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CM = os.environ.get("CM_DIR", "/tmp/claude-501/cm-repaired")
+CM = os.environ.get("CM_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".scratch", "context-mode"))
 T = " Answer in one short sentence."
 recs = json.load(open(os.path.join(fixture, "data/records.json")))
 first_err = next(i for i, l in enumerate(open(os.path.join(fixture, "logs/app.log")), 1) if "ERROR" in l)
@@ -50,7 +51,7 @@ VARIANTS = {
 
 def call(variant, prompt, sid):
     flags, tools, env = VARIANTS[variant]
-    cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--setting-sources", "project", *flags, "--allowedTools", tools]
+    cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--setting-sources", "project", "--model", MODEL, *flags, "--allowedTools", tools]
     if sid:
         cmd += ["--resume", sid]
     p = subprocess.run(cmd, cwd=fixture, capture_output=True, text=True, timeout=420, stdin=subprocess.DEVNULL, env={**os.environ, **env})

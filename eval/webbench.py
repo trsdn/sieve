@@ -7,12 +7,13 @@ usage: webbench.py WEBFIXTURE_EXPECTED_JSON OUT.jsonl REPS
 """
 import json, os, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
+MODEL = os.environ.get("BENCH_MODEL", "claude-opus-5-5")  # pinned: the runs in the README used this model
 
 exp = json.load(open(sys.argv[1])); out = sys.argv[2]; reps = int(sys.argv[3])
 fixture = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".scratch", "fixture"))
 SIEVE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CM = os.environ.get("CM_DIR", "/tmp/claude-501/cm-repaired")
-MCP = os.environ.get("PLAYWRIGHT_MCP_CONFIG", "/tmp/claude-501/playwright-mcp.json")
+CM = os.environ.get("CM_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".scratch", "context-mode"))
+MCP = os.environ.get("PLAYWRIGHT_MCP_CONFIG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".scratch", "playwright-mcp.json"))
 B = "http://127.0.0.1:8791"
 T = " Answer in one short sentence."
 TOLD = " Use the context-mode tools (ctx_execute / ctx_execute_file) to process large data instead of reading it into your context."
@@ -35,7 +36,7 @@ def one(job):
     variant, task, rep = job
     flags, tools, suffix = VARIANTS[variant]
     prompt, expected = TASKS[task]
-    cmd = ["claude", "-p", prompt + suffix, "--output-format", "stream-json", "--verbose", "--setting-sources", "project",
+    cmd = ["claude", "-p", prompt + suffix, "--output-format", "stream-json", "--verbose", "--setting-sources", "project", "--model", MODEL,
            "--mcp-config", MCP, *flags, "--allowedTools", tools]
     # WEB_NO_EVALUATE=1: the page cannot be scripted, so the snapshot has to be read (the case context-mode describes)
     if os.environ.get("WEB_NO_EVALUATE"):

@@ -7,12 +7,13 @@ uncached input, cost. usage: repobench.py TEMPLATE_DIR OUT.jsonl REPS
 """
 import json, os, shutil, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
+MODEL = os.environ.get("BENCH_MODEL", "claude-opus-5-5")  # pinned: the runs in the README used this model
 
 template, out, reps = os.path.abspath(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 # not under a hidden folder: Claude Code treats files there as sensitive and asks before editing
 runs_root = os.environ.get("BENCH_RUNS", os.path.expanduser("~/dev/sieve-bench-runs"))
 SIEVE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CM = os.environ.get("CM_DIR", "/tmp/claude-501/cm-repaired")
+CM = os.environ.get("CM_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".scratch", "context-mode"))
 STEPS = [
     ("Run the test suite verbosely with `python3 -m unittest discover -s tests -v` and tell me how many tests were skipped and how many failed.", ["5", "26"]),
     ("Find the cause of the failing tests and fix it so that all tests pass. Do not change the tests.", None),  # judged by running the suite
@@ -41,7 +42,7 @@ VARIANTS = {
 
 def call(variant, prompt, sid, cwd):
     flags, tools, env = VARIANTS[variant]
-    cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--setting-sources", "project", *flags, "--allowedTools", tools]
+    cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--setting-sources", "project", "--model", MODEL, *flags, "--allowedTools", tools]
     if sid:
         cmd += ["--resume", sid]
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=900, stdin=subprocess.DEVNULL, env={**os.environ, **env})

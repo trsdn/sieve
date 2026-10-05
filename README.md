@@ -139,6 +139,30 @@ Measured effects:
 
 Over four prompt sets the chosen setting kept all 125 requests that need the whole output; the 0.5 threshold was picked on those same sets, and the first three sets share phrasing with the criteria, so read the cut rate (83-100%) as optimistic and the harder set (88%) as the better estimate. All prompts and outputs are small, hand-written and from one person.
 
+## Reproducing the benchmarks
+
+Everything the benchmarks read is rebuilt from nothing by one script, at pinned versions:
+
+```sh
+sh eval/setup_bench.sh                  # fixtures, web pages, both repository templates, Playwright config
+sh eval/setup_bench.sh --context-mode   # also a working copy of context-mode for the comparisons
+```
+
+It writes to `.scratch/` (git-ignored; `SCRATCH=<dir>` to put it elsewhere) and stops if a template does not fail exactly as described below.
+
+| Input | How it is made |
+| --- | --- |
+| `fixture/` | `eval/make_fixture.py`, fixed seed: logs, JSON, source files, a deep file tree, a test script, 150 git commits. Expected answers in `fixture_expected.json` |
+| `web/` | `eval/make_web.py`, fixed seed: an order ledger (450 rows) and a changelog (140 entries). Expected answers in `web_expected.json` |
+| `realrepo-template/` | [more-itertools](https://github.com/more-itertools/more-itertools) at `1ea82a7`, with `ilen()` changed to count pairs (uncommitted). 26 tests fail |
+| `realrepo-hard/` | the same commit, with `windowed()` padding one value too many, committed as "Tidy up windowed padding" so `git diff` does not show it. 10 tests fail |
+| `context-mode/` | [context-mode](https://github.com/mksglu/context-mode) at `5a92b7c` (1.0.169), runtime dependencies installed with a trimmed `package.json` (its own start-up install fails, see below) |
+| `playwright-mcp.json` | `npx @playwright/mcp@latest --headless --isolated` |
+
+Versions the README's numbers come from: Claude Code 2.1.289, model `claude-opus-5-5` (now pinned in every script, `BENCH_MODEL` to change it; earlier runs did not record the model, they used the account default, which was this one when checked), strands-decider build `6d5dec6` with checkpoint `StrandsAgents/strands-decider-2B-hobson-v19` on MLX, Python 3.14, macOS on Apple silicon. Each run gets its own copy of a template under `~/dev/sieve-bench-runs` (`BENCH_RUNS`).
+
+What can still make a rerun differ: the model's own variance (about ±15% between runs of the same session, so compare setups side by side and use 5 or more sessions per setup), prompt-cache state (costs swing with it; tokens and calls are steadier), a newer Claude Code (it changes how it cuts and stores large outputs), and `@playwright/mcp@latest`.
+
 ## Real use (`eval/real_report.py`)
 
 Benchmarks are written by the people who build the tool; real sessions are the test that counts. Load sieve in every session and keep a control group:
@@ -147,7 +171,7 @@ Benchmarks are written by the people who build the tool; real sessions are the t
 "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/dev/sieve", "SIEVE_HOLDOUT": "0.2" }
 ```
 
-in `~/.claude/settings.json`. With `SIEVE_HOLDOUT=0.2` one session in five is a holdout: no cuts, no guide, no effort change, no reminder, no toast; it only logs what it would have done. Every line of `usage.jsonl` carries the session id and a project key; bench runs (cwd under `sieve-bench-runs` or `.scratch`, or `SIEVE_BENCH=1`) are marked and left out. Logged per session: each prompt's p(simple) and p(reminder) (one decider call for both), cuts and would-be cuts, follow-ups (a later call that reads a cut output's file), searches, restored repeats.
+in `~/.claude/settings.json`. With `SIEVE_HOLDOUT=0.2` one session in five is a holdout (set to `0.5` from 2026-10-05: equal groups reach a usable comparison faster): no cuts, no guide, no effort change, no reminder, no toast; it only logs what it would have done. Every line of `usage.jsonl` carries the session id and a project key; bench runs (cwd under `sieve-bench-runs` or `.scratch`, or `SIEVE_BENCH=1`) are marked and left out. Logged per session: each prompt's p(simple) and p(reminder) (one decider call for both), cuts and would-be cuts, follow-ups (a later call that reads a cut output's file), searches, restored repeats.
 
 `python3 eval/real_report.py [--days N] [--sessions]` joins that log with Claude Code's own transcripts (`~/.claude/projects/*/<session>.jsonl`, token usage per model call) and compares active sessions with the holdout: window-turns, per call, output tokens, calls; how often the model went back to a cut output; and how many low-effort sessions later had a request with p(simple) < 0.3 (the effort job's known risk).
 
