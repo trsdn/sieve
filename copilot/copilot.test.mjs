@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { NEED_QUESTION, LOOKUP_AT, needState } from '../hooks/lib.ts';
-import { classifyRequest } from './intent.mjs';
+import { classifyRequest, prioritizeRequest } from './intent.mjs';
 import { askNeed } from './decider.mjs';
 import { runHook } from './hook.mjs';
 import { install } from './install.mjs';
@@ -36,9 +36,9 @@ for (const [prompt, intent] of [
   ['Determine the exact LOOKUP_TOKEN value.', 'lookup'],
   ['Welcher Test liefert genau diesen Token?', 'lookup'],
   ['Summarize the output and give me the exact token.', 'lookup'],
-  ['Summarize the output. Also include metric_61.', 'unknown'],
-  ['Summarize the output. Do not omit metric_61.', 'unknown'],
-  ['Summarize the output. You may include metric_61.', 'unknown'],
+  ['Summarize the output. Also include metric_61.', 'lookup'],
+  ['Summarize the output. Do not omit metric_61.', 'lookup'],
+  ['Summarize the output. You may include metric_61.', 'lookup'],
   ['Summarize the output. Final answer must include the token.', 'lookup'],
   ['Summarize the output. Do not summarize, but give me the exact token.', 'lookup'],
   ['Do not look up or report LOOKUP_TOKEN. Summarize the output.', 'summary'],
@@ -46,6 +46,77 @@ for (const [prompt, intent] of [
   ['Run the tests.', 'unknown'],
   ['', 'unknown'],
 ]) test(`request intent: ${prompt}`, () => assert.equal(classifyRequest(prompt), intent));
+
+test('precision requirements veto the decider even when mixed into a broad overview', async t => {
+  const { event } = await context(t);
+  for (const prompt of [
+    'Do not edit files. Is the middle entry slower than its predecessor?',
+    'Run exactly `node checks.mjs` once. The broad picture is enough. Also include test_73.',
+    'Do not read source. A brief health check, but retain the duration attached to metric_61.',
+    'Keine Dateien bearbeiten. Kurze Einsch\u00e4tzung, aber die Laufzeit von test_73 muss dabei sein.',
+    'Run exactly `node checks.mjs` once. Report the runner-up by duration.',
+  ]) {
+    assert.equal(classifyRequest(prompt), 'lookup');
+    await runHook({ ...event, prompt }, 'prompt');
+    assert.deepEqual(await runHook(event, 'result', {
+      fetchImpl: async () => { assert.fail('precision must never be handed to the decider'); },
+    }), {});
+  }
+});
+
+test('precision words inside an execution command do not veto a genuine summary', () => {
+  assert.equal(classifyRequest('Run exactly `node test_73.mjs --duration` once. Summarize the test output.'), 'summary');
+});
+
+test('goal prioritization rotates only a recognized leading procedural block without losing bytes', () => {
+  const procedure = 'Run exactly `node ./v1.2/checks.mjs; echo "done."` once, synchronously, without redirection or pipes. Do not read source, environment, hooks or config. Do not edit files, delegate or use the network. You may use targeted grep or view on the original-output file named in the result; never rerun the fixture.';
+  const task = 'Is the run healthy? Also include metric_61. Answer only {"status": "...", "measurement": 0}.';
+  const prompt = `${procedure}\n\n${task}`;
+  assert.equal(prioritizeRequest(prompt), `${task}\n\n${procedure}`);
+  assert.equal(prioritizeRequest(prompt).length, prompt.length);
+  assert.equal(classifyRequest(prioritizeRequest(prompt)), classifyRequest(prompt));
+});
+
+test('mixed requirements, positional references and quoted instructions are not reordered', () => {
+  for (const prompt of [
+    'Run exactly `node checks.mjs` once and report test_61. Is the rest healthy?',
+    'Do not edit files, but give me metric_61. Is the rest healthy?',
+    'Do not read source unless test_61 is missing. Is the rest healthy?',
+    'Run exactly `node checks.mjs` once. Then describe what happened.',
+    'Run exactly `node checks.mjs` once. Follow the requirements above.',
+    '"Run exactly `node checks.mjs` once." Is that instruction sensible?',
+    '```\nRun exactly `node checks.mjs` once.\n```\nIs that instruction sensible?',
+    'Run exactly `node checks.mjs` once.',
+    'What happened? Do not read source.',
+    '',
+  ]) assert.equal(prioritizeRequest(prompt), prompt);
+});
+
+test('German procedure prioritization preserves accents, measurements and constraints', () => {
+  const procedure = 'F\u00fchre genau `node checks.mjs` einmal aus. Keine Dateien bearbeiten.';
+  const task = 'Wirkt der Lauf unauff\u00e4llig? Die Laufzeit von test_73 muss dabei sein.';
+  assert.equal(prioritizeRequest(`${procedure} ${task}`), `${task} ${procedure}`);
+});
+
+test('self-contained conditional answer formats are preserved ahead of procedure', () => {
+  const procedure = 'Run exactly `node checks.mjs` once.';
+  const task = 'Did that command behave itself? Answer "ok" if it succeeded, otherwise "failed".';
+  assert.equal(prioritizeRequest(`${procedure} ${task}`), `${task} ${procedure}`);
+});
+
+test('the actual decider payload puts goals first without changing its question or output context', async () => {
+  const procedure = 'Run exactly `node checks.mjs` once. Do not read source.';
+  const task = 'Can we carry on? Include the measurement for test_61.';
+  await askNeed(`${procedure} ${task}`, 'node checks.mjs', output, {
+    fetchImpl: async (_, options) => {
+      assert.deepEqual(JSON.parse(options.body), {
+        state: needState(`${task} ${procedure}`, 'Bash', 'node checks.mjs', output),
+        questions: NEED_QUESTION,
+      });
+      return response(0.9);
+    },
+  });
+});
 
 test('the shared decider question, state and threshold retain the measured wording', async () => {
   assert.equal(LOOKUP_AT, 0.5);

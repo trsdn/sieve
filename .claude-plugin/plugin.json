@@ -1,5 +1,5 @@
 {
   "name": "sieve",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Keeps unnecessary tool output out of context in Claude Code and Copilot CLI, with a shared local strands-decider for close calls."
 }

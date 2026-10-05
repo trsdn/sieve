@@ -1,0 +1,40 @@
+{
+  "dev": [
+    { "need": false, "prompt": "Run exactly `node checks.mjs` once, synchronously, without redirection or pipes. Do not read source, environment, hooks or config. Does this seem like an uneventful run? Answer in a sentence." },
+    { "need": false, "prompt": "Do not edit files, delegate or use the network. Can we carry on with the next task?" },
+    { "need": false, "prompt": "Run exactly `node checks.mjs` once. Is anything here cause for concern?" },
+    { "need": false, "prompt": "Keine Dateien bearbeiten. Wirkt das insgesamt unauff\u00e4llig?" },
+    { "need": true, "prompt": "Run exactly `node checks.mjs` once, synchronously, without redirection or pipes. I need the slowest item in this output, not an approximation. Answer with its name and duration." },
+    { "need": true, "prompt": "Do not read source. Tell me what metric_61 says. Include its numeric measurement." },
+    { "need": true, "prompt": "Run exactly `node checks.mjs` once. A short impression is fine, but do not omit the entry for test_61." },
+    { "need": true, "prompt": "F\u00fchre genau `node checks.mjs` einmal aus. Nenne den langsamsten Eintrag und seine Laufzeit." }
+  ],
+  "holdout": [
+    { "need": false, "prompt": "Do not read source, environment, hooks or config. Would you regard this as routine noise rather than something worrying?" },
+    { "need": false, "prompt": "Run exactly `node checks.mjs` once. Give me the gist, not a line-by-line account." },
+    { "need": false, "prompt": "F\u00fchre genau `node checks.mjs` einmal aus. Kann ich nach diesem Lauf beruhigt weitermachen?" },
+    { "need": false, "prompt": "Keine Dateien bearbeiten. Muss ich mir bei diesem Lauf Sorgen machen?" },
+    { "need": true, "prompt": "Run exactly `node checks.mjs` once. Report the runner-up by duration, with its measurement." },
+    { "need": true, "prompt": "Do not edit files, delegate or use the network. Is the middle entry slower than its predecessor? I need a definitive comparison." },
+    { "need": true, "prompt": "Run exactly `node checks.mjs` once. The broad picture is enough. Also include the measurement attached to test_73." },
+    { "need": true, "prompt": "Do not read source. A brief health check, but retain the duration attached to metric_61." },
+    { "need": true, "prompt": "F\u00fchre genau `node checks.mjs` einmal aus. Welcher Eintrag liegt bei der Laufzeit an zweiter Stelle?" },
+    { "need": true, "prompt": "Keine Dateien bearbeiten. Kurze Einsch\u00e4tzung, aber die Laufzeit von test_73 muss dabei sein." },
+    { "need": true, "prompt": "Run exactly `node checks.mjs` once and include the measurement of test_61. Is the run otherwise healthy?" },
+    { "need": true, "prompt": "Do not edit files, but give me the measurement for test_61. Tell me whether the rest is routine." }
+  ],
+  "holdout2": [
+    { "need": false, "prompt": "Run exactly `node checks.mjs` once. Does the output feel reassuring overall?" },
+    { "need": false, "prompt": "Do not read source. Is this broadly what a clean run should look like?" },
+    { "need": false, "prompt": "Keine Dateien bearbeiten. Macht der Lauf insgesamt einen normalen Eindruck?" },
+    { "need": false, "prompt": "Do not edit files, delegate or use the network. Should I be concerned, or does this seem routine?" },
+    { "need": true, "prompt": "Run exactly `node checks.mjs` once. For my notes, include the measurement associated with test_58." },
+    { "need": true, "prompt": "Do not read source. What latency did metric_84 record?" },
+    { "need": true, "prompt": "Run exactly `node checks.mjs` once. A general impression, plus the duration for test_19." },
+    { "need": true, "prompt": "Keine Dateien bearbeiten. Fuer meine Notizen brauche ich den Messwert zu metric_66." },
+    { "need": true, "prompt": "Run exactly `node checks.mjs` once. Contrast the centre entry with the one immediately beside it." },
+    { "need": true, "prompt": "Do not read source. Which result is the second slowest?" },
+    { "need": true, "prompt": "Run exactly `node checks.mjs` once. Give me the value appearing beside metric_39." },
+    { "need": true, "prompt": "Do not edit files, but preserve the value from test_27 in your answer." }
+  ]
+}

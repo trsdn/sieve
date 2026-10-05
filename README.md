@@ -37,6 +37,14 @@ node --experimental-strip-types --test copilot/copilot.test.mjs
 
 Pure logic lives in `hooks/lib.ts` with tests in `hooks/lib.test.ts`. Everything that takes `$` stays in `hooks/register.ts`, as top-level functions: the validator refuses `$` passed to closures.
 
+The Copilot request preparation has bilingual development and holdout cases:
+
+```sh
+node --experimental-strip-types eval/copilot_decider_eval.mjs
+```
+
+This needs the existing local decider. It exits nonzero for an unsafe cut or incomplete service coverage. Its original/prepared arms both use the current precision veto and differ only in input ordering; they are not a release-versus-candidate token benchmark. The first holdout is retained as a regression set after it exposed unsafe mixed-requirement decisions; `holdout2` was written before adding the precision veto.
+
 ## GitHub Copilot CLI
 
 Requires **Node 22.18+ or 24+** and Copilot CLI with command-hook `modifiedResult` support. Tested with Copilot CLI **1.0.92-3**. No npm packages are needed.
@@ -56,6 +64,8 @@ The Copilot adapter:
 - Handles `bash` and `powershell` results for arbitrary commands, not just benchmark fixtures. It reuses sieve's test, build, install and `git log` filters; unrecognized output, code and patches remain unchanged.
 - Captures the current request via `userPromptSubmitted`. Clear detail/lookup requests keep the original output. Clear summary requests allow a recognized filter.
 - **Uses the existing shared decider** for unknown intent when a recognized filter could help. The question and the **0.5 lookup threshold** are exactly the ones used by the Claude adapter. A probability of 0.5 or higher keeps the original.
+- Before the Copilot decider call, a strictly recognized leading block of execution instructions is moved behind the task and its answer requirements. No text is deleted or truncated by this preparation. Mixed clauses and positional references stay in their original order; the raw-request detail veto still runs first, and the overlong-request safeguard is unchanged. The Claude adapter is unaffected.
+- Precision requirements such as named test/metric identifiers, durations, measurements, rankings or neighbour comparisons keep the original before any decider call, including when mixed into an overview request. This conservative veto can miss optimization opportunities; it prevents a broad health-check interpretation from dropping explicitly needed data.
 - Never starts the decider. It contacts only `127.0.0.1:8765`, aborts after **1.5 seconds**, and applies a **30-second session cooldown** after an unavailable, malformed or timed-out reply. The failure is logged; the original output stays intact.
 - With `SIEVE_DECIDER=0`, only explicit rule-approved summaries are filtered. Missing request state or an unknown request truncated beyond 500 characters is kept rather than guessed.
 - Reads Copilot's full persisted file when a large shell result has already been spilled. Full originals remain inside the project's `.sieve/sessions/`; totals, failure diagnostics and shell completion metadata are preserved.
@@ -78,6 +88,8 @@ The local prototype was evaluated in **60 fresh sessions** (six workloads, five 
 These are **synthetic, rules-only prototype measurements, not a benchmark of the newly added Copilot decider path or a real repository**. Cumulative input includes cached input on every model request; it is not the same as billing. Aggregate metrics are in `eval/copilot_benchmark.json`. Do not infer general speed/cost savings from this small task mix.
 
 The release adapter's installer, safe fallback and real shared-decider path are checked separately:
+
+The v0.2.1 Copilot candidate was also compared with v0.2.0 in **50 fresh sessions**: five synthetic workloads, five paired repetitions per version, with the shared decider enabled. All 50 answers were correct; one run carried a policy warning and remains in the totals. Previously unknown overview requests were filtered in 5/5 candidate runs versus 0/5 released-version runs, with **10.9% less median paired cumulative input**. All 15 precision-output pairs were byte-identical. Across this particular task mix, cumulative input fell 2.2% and credits 6.2%; credits are cache-sensitive, and this is not a general speed or cost claim. Ordering alone had unsafe cuts in the first local holdout, so the candidate includes the precision veto as well. A final separate local evaluation retained one timeout and was marked incomplete for availability; unavailable decisions keep the original.
 
 ```sh
 SIEVE_LIVE_DECIDER=1 node --experimental-strip-types --test copilot/copilot.test.mjs
